@@ -29,8 +29,8 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 try:
-    from model import config
-    from model import battery_metadata
+    import config
+    import battery_metadata
 except ImportError:  # pragma: no cover
     import config  # type: ignore
     import battery_metadata  # type: ignore
