@@ -1,8 +1,11 @@
 """Build a deterministic cell/image index for CT diffusion training.
 
-This script scans the dataset folder structure:
+This script scans a dataset folder structure containing one or more directories
+named "slices" at arbitrary depth, e.g.:
 
-  BASE_PATH/<format_dir>/slices/<cell_dir>/radial_images/*.png
+  BASE_PATH/.../<cell_format>/.../slices/<cell_id>/radial_images/*.png
+
+where <cell_format> contains one of: 18650 / 2170 / 4680.
 
 It groups images by cell folder ("cell_id") and filters slices by relative depth
 in [min_rel_depth, max_rel_depth].
@@ -59,20 +62,25 @@ def build_index(
 
     cells: Dict[str, dict] = {}
 
-    format_dirs = [
-        d
-        for d in _safe_listdir(base_path)
-        if os.path.isdir(os.path.join(base_path, d))
-    ]
+    # We accept additional intermediate directory levels (e.g. manufacturer/voltage).
+    valid_formats = ("18650", "2170", "4680")
 
-    for format_dir in sorted(format_dirs):
-        cell_format = battery_metadata.extract_cell_format(format_dir)
-        # Restrict to known formats for now.
-        if not any(cf in cell_format for cf in ["18650", "2170", "4680"]):
+    for root, dirs, _files in os.walk(base_path):
+        # Only consider directories that directly contain a "slices" directory.
+        if "slices" not in dirs:
             continue
 
-        slices_dir = os.path.join(base_path, format_dir, "slices")
-        if not os.path.exists(slices_dir):
+        slices_dir = os.path.join(root, "slices")
+        rel_slices = os.path.relpath(slices_dir, base_path).replace("\\", "/")
+        parts = [p for p in rel_slices.split("/") if p]
+
+        fmt_token = next((p for p in parts if p in valid_formats), None)
+        if fmt_token is None:
+            continue
+        cell_format = battery_metadata.extract_cell_format(fmt_token)
+
+        max_height = battery_metadata.get_max_height_from_format(cell_format)
+        if max_height is None or max_height == 0:
             continue
 
         for cell_dir in sorted(_safe_listdir(slices_dir)):
@@ -85,11 +93,7 @@ def build_index(
                 continue
 
             # Group key for splitting.
-            cell_id = os.path.join(format_dir, "slices", cell_dir).replace("\\", "/")
-
-            max_height = battery_metadata.get_max_height_from_format(cell_format)
-            if max_height is None or max_height == 0:
-                continue
+            cell_id = os.path.relpath(cell_path, base_path).replace("\\", "/")
 
             entries: List[ImageEntry] = []
             for fn in sorted(_safe_listdir(radial_dir)):

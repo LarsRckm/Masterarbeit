@@ -113,6 +113,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
         # Derive metadata.
         cell_format = cell_info.get("cell_format", "Unknown")
+        # manufacturer inference uses image size and (optionally) relative path hints.
         manufacturer = battery_metadata.determine_manufacturer(w, h, rep_relpath)
         chemistry = battery_metadata.determine_chemistry(manufacturer)
         voxel_size_um = battery_metadata.determine_voxel_size(cell_format)
