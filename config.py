@@ -15,7 +15,7 @@ import os
 
 # Geben Sie hier den Startpfad an, der die Ordner der einzelnen Zellformate enthält.
 # Beispiel: "C:/Data/Battery_CT_Scans"
-BASE_PATH = "C:/Path/To/Your/Dataset"
+BASE_PATH = "/data/Data/projects/GLIMPSE/cylindrical"
 
 # -----------------------------------------------------------------------------
 # Polar representation (model input)
