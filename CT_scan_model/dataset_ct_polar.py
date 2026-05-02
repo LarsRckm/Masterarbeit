@@ -16,6 +16,8 @@ import os
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
+import random
+
 import numpy as np
 import torch
 from torch.utils.data import Dataset
@@ -174,3 +176,138 @@ class BatteryCTPolarDataset(Dataset):
         )
         cond = (cat, cont)
         return x, cond, torch.from_numpy(mask)
+
+
+class BatteryCTPerCellDataset(Dataset):
+    """Cell-level dataset: one sample per cell index.
+
+    Each __getitem__ selects one slice from the given cell_id. This is intended
+    to drastically reduce redundancy when many slice depths exist per cell.
+
+    If you call set_epoch(e), the slice selection becomes deterministic per cell
+    (cycling through a per-cell shuffled slice list).
+
+    Note: deterministic cycling is only reliable with num_workers=0.
+    """
+
+    def __init__(
+        self,
+        index_json: str,
+        geometry_json: str,
+        splits_json: str,
+        split: str,
+        batch_size: int,
+        seed: int = 42,
+        pad_to_batch: bool = True,
+    ) -> None:
+        if split not in {"train", "val", "test"}:
+            raise ValueError("split must be one of: train/val/test")
+
+        with open(index_json, "r", encoding="utf-8") as f:
+            self.index = json.load(f)
+        with open(geometry_json, "r", encoding="utf-8") as f:
+            self.geometry = json.load(f)["cells"]
+        with open(splits_json, "r", encoding="utf-8") as f:
+            splits = json.load(f)
+
+        self.base_path = self.index["base_path"]
+        self.theta_bins = int(project_config.POLAR_THETA_BINS)
+        self.r_model = int(project_config.POLAR_R_MODEL)
+        self.seed = int(seed)
+        self._epoch = 1
+
+        self.cell_ids: List[str] = list(splits[f"{split}_cells"])
+        if not self.cell_ids:
+            raise RuntimeError(f"No cells found for split='{split}'.")
+
+        if pad_to_batch and int(batch_size) > 0:
+            # Pad so each epoch has full batches.
+            rng = random.Random(self.seed + 17)
+            while len(self.cell_ids) % int(batch_size) != 0:
+                self.cell_ids.append(rng.choice(self.cell_ids))
+
+        # Build per-cell slice lists.
+        allowed = set(self.cell_ids)
+        self.cell_to_images: Dict[str, List[dict]] = {}
+        for cell_id, cell_info in self.index["cells"].items():
+            if cell_id not in allowed:
+                continue
+            imgs = list(cell_info.get("images", []))
+            if not imgs:
+                continue
+            self.cell_to_images[cell_id] = imgs
+
+        # Pre-shuffle each cell's slice list deterministically.
+        for cid, imgs in self.cell_to_images.items():
+            rng = random.Random(self.seed ^ hash(cid))
+            rng.shuffle(imgs)
+
+    def set_epoch(self, epoch: int) -> None:
+        self._epoch = int(epoch)
+
+    def __len__(self) -> int:
+        return len(self.cell_ids)
+
+    def __getitem__(self, idx: int):
+        import random as _random  # local to avoid global worker-state surprises
+
+        cell_id = self.cell_ids[idx]
+        g = self.geometry.get(cell_id)
+        if g is None:
+            raise KeyError(f"Missing geometry for cell_id: {cell_id}. Run precompute_geometry.py")
+
+        imgs = self.cell_to_images.get(cell_id)
+        if not imgs:
+            raise KeyError(f"No images indexed for cell_id: {cell_id}. Rebuild cell_index.json")
+
+        # Deterministic per-epoch cycling through a per-cell shuffled list.
+        j = (self._epoch - 1) % len(imgs)
+        d = imgs[j]
+
+        img_relpath = d["relpath"]
+        slice_depth_relative = float(d.get("rel_depth", 0.0))
+
+        img_path = os.path.join(self.base_path, img_relpath)
+        if cv2 is None:
+            raise RuntimeError("OpenCV (cv2) is required for dataset loading.")
+        gray = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
+        if gray is None:
+            raise FileNotFoundError(f"Cannot open image: {img_path}")
+
+        cx = float(g["cx"])
+        cy = float(g["cy"])
+        r_valid = float(g["r_valid"])
+        r_use = int(min(max(1.0, r_valid), float(self.r_model)))
+
+        polar = _to_polar(gray, cx=cx, cy=cy, r_max=r_use, n_angles=self.theta_bins)
+        polar = (polar / 255.0) * 2.0 - 1.0
+
+        img_full = np.zeros((self.r_model, self.theta_bins), dtype=np.float32)
+        img_full[:r_use, :] = polar[:r_use, :]
+        mask = np.zeros((self.r_model, self.theta_bins), dtype=np.float32)
+        mask[:r_use, :] = 1.0
+        x = torch.from_numpy(np.stack([img_full, mask], axis=0)).to(dtype=torch.float32)
+
+        cell_format = str(g.get("cell_format", "Unknown"))
+        manufacturer = str(g.get("manufacturer", "Unknown"))
+        chemistry = str(g.get("chemistry", "Unknown"))
+        voxel_size_um = g.get("voxel_size_um", 0.0)
+        voxel_size_um = 0.0 if voxel_size_um is None else float(voxel_size_um)
+
+        cat = torch.tensor(
+            [
+                _vocab_index(project_config.CELL_FORMAT_VOCAB, cell_format),
+                _vocab_index(project_config.MANUFACTURER_VOCAB, manufacturer),
+                _vocab_index(project_config.CHEMISTRY_VOCAB, chemistry),
+            ],
+            dtype=torch.long,
+        )
+        cont = torch.tensor(
+            [
+                float(slice_depth_relative),
+                float(voxel_size_um),
+                float(r_use) / float(self.r_model),
+            ],
+            dtype=torch.float32,
+        )
+        return x, (cat, cont), torch.from_numpy(mask)

@@ -24,7 +24,9 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
-from ..dataset_ct_polar import BatteryCTPolarDataset
+import math
+
+from ..dataset_ct_polar import BatteryCTPerCellDataset, BatteryCTPolarDataset
 from ..diffusion_polar import Diffusion
 from ..modules_polar_ct import UNet_conditional_polar
 
@@ -67,7 +69,12 @@ def main(argv: Optional[list[str]] = None) -> int:
     p.add_argument("--geometry", default=os.path.join("model", "CT_scan_model", "cell_geometry.json"))
     p.add_argument("--splits", default=os.path.join("model", "CT_scan_model", "splits.json"))
 
-    p.add_argument("--epochs", type=int, default=50)
+    p.add_argument(
+        "--epochs",
+        type=int,
+        default=0,
+        help="Number of epochs. If 0, derive from --slices-per-cell and batch size.",
+    )
     p.add_argument("--batch-size", type=int, default=8)
     p.add_argument("--lr", type=float, default=2e-4)
     p.add_argument("--accumulation-steps", type=int, default=1)
@@ -101,9 +108,34 @@ def main(argv: Optional[list[str]] = None) -> int:
     with open(os.path.join(run_dir, "run_config.json"), "w", encoding="utf-8") as f:
         json.dump(vars(args), f, indent=2)
 
-    train_ds = BatteryCTPolarDataset(args.index, args.geometry, splits_json=args.splits, split="train")
+    if int(args.slices_per_cell) < 1:
+        raise ValueError("--slices-per-cell must be >= 1")
+
+    # Cell-level training dataset (one sample per cell per epoch).
+    train_ds = BatteryCTPerCellDataset(
+        args.index,
+        args.geometry,
+        splits_json=args.splits,
+        split="train",
+        batch_size=int(args.batch_size),
+        seed=int(args.seed),
+        pad_to_batch=True,
+    )
+
+    # Validation/test still evaluate on all slices (as currently indexed).
     val_ds = BatteryCTPolarDataset(args.index, args.geometry, splits_json=args.splits, split="val")
     test_ds = BatteryCTPolarDataset(args.index, args.geometry, splits_json=args.splits, split="test")
+
+    # Derive epoch count if not explicitly set.
+    if int(args.epochs) <= 0:
+        # Epoch = one pass over (padded) train cells. We cycle one slice per cell
+        # per epoch, so seeing K distinct slices per cell implies K epochs.
+        args.epochs = int(args.slices_per_cell)
+        print(
+            "Derived epochs:",
+            args.epochs,
+            f"(epoch=pass_over_cells, train_cells_per_epoch={len(train_ds)}, slices_per_cell={int(args.slices_per_cell)})",
+        )
 
     train_loader = DataLoader(
         train_ds,
@@ -161,6 +193,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     # Training
     best_val = float("inf")
     for epoch in range(1, int(args.epochs) + 1):
+        # Ensure per-cell slice selection changes each epoch.
+        train_ds.set_epoch(epoch)
         model.train()
         optimizer.zero_grad(set_to_none=True)
 
@@ -237,3 +271,9 @@ def main(argv: Optional[list[str]] = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+    p.add_argument(
+        "--slices-per-cell",
+        type=int,
+        default=1,
+        help="How many distinct slice depths per cell should be seen over the full training run.",
+    )
