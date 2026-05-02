@@ -139,9 +139,26 @@ def main(argv: Optional[list[str]] = None) -> int:
         pad_to_batch=True,
     )
 
-    # Validation/test still evaluate on all slices (as currently indexed).
-    val_ds = BatteryCTPolarDataset(args.index, args.geometry, splits_json=args.splits, split="val")
-    test_ds = BatteryCTPolarDataset(args.index, args.geometry, splits_json=args.splits, split="test")
+    # Validation/test: also cell-based for speed. We evaluate deterministically on the
+    # same K slices per cell (K = slices_per_cell) each time.
+    val_ds = BatteryCTPerCellDataset(
+        args.index,
+        args.geometry,
+        splits_json=args.splits,
+        split="val",
+        batch_size=int(args.batch_size),
+        seed=int(args.seed),
+        pad_to_batch=False,
+    )
+    test_ds = BatteryCTPerCellDataset(
+        args.index,
+        args.geometry,
+        splits_json=args.splits,
+        split="test",
+        batch_size=int(args.batch_size),
+        seed=int(args.seed),
+        pad_to_batch=False,
+    )
 
     # Derive epoch count if not explicitly set.
     if int(args.epochs) <= 0:
@@ -192,20 +209,35 @@ def main(argv: Optional[list[str]] = None) -> int:
     def run_eval(loader: DataLoader, use_ema: bool = False) -> float:
         net = ema_model if use_ema else model
         net.eval()
-        losses = []
+        k = int(args.slices_per_cell)
+        if k < 1:
+            raise ValueError("--slices-per-cell must be >= 1")
+
+        # Evaluate on the same K slice choices per cell each time (set_epoch = 1..K).
+        # Note: deterministic cycling is most reliable with num_workers=0.
+        total = 0.0
+        count = 0
         with torch.no_grad():
-            for x, cond, mask in loader:
-                x = x.to(device)
-                mask = mask.to(device)
-                cat, cont = cond
-                cat = cat.to(device)
-                cont = cont.to(device)
-                t = diffusion.sample_timesteps(x.shape[0], device=device)
-                x_t, noise = diffusion.noise_images(x, t)
-                pred = net(x_t, t, (cat, cont))
-                losses.append(float(masked_mse(pred, noise, mask).item()))
+            for kk in range(1, k + 1):
+                if hasattr(loader.dataset, "set_epoch"):
+                    loader.dataset.set_epoch(kk)
+
+                for x, cond, mask in loader:
+                    bs = int(x.shape[0])
+                    x = x.to(device)
+                    mask = mask.to(device)
+                    cat, cont = cond
+                    cat = cat.to(device)
+                    cont = cont.to(device)
+                    t = diffusion.sample_timesteps(bs, device=device)
+                    x_t, noise = diffusion.noise_images(x, t)
+                    pred = net(x_t, t, (cat, cont))
+                    loss = masked_mse(pred, noise, mask).item()
+                    total += float(loss) * bs
+                    count += bs
+
         net.train()
-        return float(sum(losses) / max(1, len(losses)))
+        return float(total / max(1, count))
 
     # Training
     best_val = float("inf")
