@@ -18,11 +18,17 @@ import datetime as _dt
 import json
 import os
 import random
+import sys
 from typing import Optional
 
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
+
+try:
+    from tqdm import tqdm  # type: ignore
+except Exception:  # pragma: no cover
+    tqdm = None
 
 import math
 
@@ -70,6 +76,12 @@ def main(argv: Optional[list[str]] = None) -> int:
     p.add_argument("--splits", default=os.path.join("model", "CT_scan_model", "splits.json"))
 
     p.add_argument(
+        "--slices-per-cell",
+        type=int,
+        default=1,
+        help="How many distinct slice depths per cell should be seen over the full training run.",
+    )
+    p.add_argument(
         "--epochs",
         type=int,
         default=0,
@@ -90,6 +102,11 @@ def main(argv: Optional[list[str]] = None) -> int:
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--run-dir", default=None, help="Output directory (default: model/CT_scan_model/runs/<timestamp>)")
     p.add_argument("--save-every", type=int, default=1, help="Save checkpoint every N epochs")
+    p.add_argument(
+        "--tqdm",
+        action="store_true",
+        help="Show a per-epoch tqdm progress bar (useful for debugging long epochs).",
+    )
     args = p.parse_args(argv)
 
     _seed_everything(int(args.seed))
@@ -199,7 +216,18 @@ def main(argv: Optional[list[str]] = None) -> int:
         optimizer.zero_grad(set_to_none=True)
 
         running = 0.0
-        for step, (x, cond, mask) in enumerate(train_loader, start=1):
+
+        use_tqdm = (bool(args.tqdm) or sys.stderr.isatty()) and tqdm is not None
+        if bool(args.tqdm) and tqdm is None:
+            raise RuntimeError("tqdm is not installed but --tqdm was requested. Install via: pip install tqdm")
+
+        train_iter = train_loader
+        pbar = None
+        if use_tqdm:
+            pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{int(args.epochs)}", unit="batch", leave=False)
+            train_iter = pbar
+
+        for step, (x, cond, mask) in enumerate(train_iter, start=1):
             x = x.to(device)
             mask = mask.to(device)
             cat, cont = cond
@@ -229,6 +257,10 @@ def main(argv: Optional[list[str]] = None) -> int:
                 ema.step_ema(ema_model, model, step_start_ema=0)
 
             running += float(loss.item())
+
+            if pbar is not None:
+                # Show the *unscaled* (per-step) loss.
+                pbar.set_postfix({"loss": f"{float(loss.item()):.4f}"})
 
         train_loss = running / max(1, len(train_loader))
         val_loss = run_eval(val_loader, use_ema=True)
