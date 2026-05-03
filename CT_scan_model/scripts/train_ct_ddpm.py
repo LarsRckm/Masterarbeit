@@ -410,6 +410,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                     with torch.no_grad():
                         ema_model.eval()
                         # Use the selected validation samples (one per format) as fixed conditions.
+                        cond_entries = []
                         for ci, (vx, vcond, vmask) in enumerate(val_loader):
                             cat, cont = vcond
                             cat = cat.to(device)
@@ -417,6 +418,15 @@ def main(argv: Optional[list[str]] = None) -> int:
                             cond_fixed = (
                                 cat[:1].expand(int(args.sample_n), -1),
                                 cont[:1].expand(int(args.sample_n), -1),
+                            )
+
+                            # Record the exact conditioning used for this cond index.
+                            cond_entries.append(
+                                {
+                                    "cond_index": int(ci),
+                                    "cat_ids": cat[:1].detach().cpu().tolist()[0],
+                                    "cont": cont[:1].detach().cpu().tolist()[0],
+                                }
                             )
                             gen = sample_with_mask(
                                 diffusion=diffusion,
@@ -440,6 +450,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                             "sample_cfg_scale": float(args.sample_cfg_scale),
                             "checkpoint_best_path": os.path.join(run_dir, "checkpoint_best.pt"),
                             "val_selected_samples": val_samples,
+                            "sampling_conditions": cond_entries,
                         }
                         with open(os.path.join(samples_dir, "metadata.json"), "w", encoding="utf-8") as f:
                             json.dump(meta, f, indent=2)
