@@ -29,6 +29,24 @@ python -m model.CT_scan_model.scripts.train_ct_ddpm \
   --index    model/CT_scan_model/cell_index.json \
   --geometry model/CT_scan_model/cell_geometry.json \
   --splits   model/CT_scan_model/splits.json
+
+## Sampling (generate synthetic images)
+
+Generate synthetic **polar** images (and optional centered **cartesian** images) from a trained checkpoint:
+
+```powershell
+python -m model.CT_scan_model.scripts.sample_ct_ddpm \
+  --ckpt runs/ct_scan_model/<timestamp>/checkpoint_best.pt \
+  --outdir runs/ct_scan_model/<timestamp>/samples \
+  --n 8 \
+  --cell-format 18650 \
+  --manufacturer EVE \
+  --chemistry Lithium-ion \
+  --slice-depth-relative 0.50 \
+  --voxel-size-um 14.4 \
+  --r-valid-rel 0.94 \
+  --cfg-scale 1.0
+```
 ```
 
 Training outputs are written to:

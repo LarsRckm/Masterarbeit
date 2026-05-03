@@ -18,12 +18,17 @@ import datetime as _dt
 import json
 import os
 import random
+import warnings
 import sys
 from typing import Optional
 
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
+try:
+    import cv2  # type: ignore
+except Exception:  # pragma: no cover
+    cv2 = None
 
 try:
     from tqdm import tqdm  # type: ignore
@@ -32,7 +37,7 @@ except Exception:  # pragma: no cover
 
 import math
 
-from ..dataset_ct_polar import BatteryCTPerCellDataset, BatteryCTPolarDataset
+from ..dataset_ct_polar import BatteryCTPerCellDataset, BatteryCTSelectedSamplesDataset
 from ..diffusion_polar import Diffusion
 from ..modules_polar_ct import UNet_conditional_polar
 
@@ -63,6 +68,55 @@ def masked_mse(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> 
     return num / den
 
 
+def _to_uint8(img: torch.Tensor) -> torch.Tensor:
+    """Convert float [-1,1] tensor to uint8 [0,255]."""
+    return ((img + 1.0) * 0.5 * 255.0).clamp(0, 255).to(torch.uint8)
+
+
+@torch.no_grad()
+def sample_with_mask(
+    diffusion: Diffusion,
+    model: nn.Module,
+    n: int,
+    cond,
+    mask: torch.Tensor,
+    device: torch.device,
+    cfg_scale: float = 1.0,
+) -> torch.Tensor:
+    """DDPM sampling with a fixed padding mask.
+
+    Returns image channel only: [n, 1, R, Theta]
+    """
+    model.eval()
+    r = int(mask.shape[-2])
+    th = int(mask.shape[-1])
+    x_img = torch.randn((n, 1, r, th), device=device)
+    x_mask = mask.to(device=device, dtype=torch.float32)
+    if x_mask.dim() == 2:
+        x_mask = x_mask[None, None, :, :]
+    elif x_mask.dim() == 3:
+        x_mask = x_mask[:, None, :, :]
+    if x_mask.shape[0] == 1 and n != 1:
+        x_mask = x_mask.expand(n, -1, -1, -1)
+
+    for i in reversed(range(1, diffusion.noise_steps)):
+        t = torch.full((n,), i, device=device, dtype=torch.long)
+        model_in = torch.cat([x_img, x_mask], dim=1)
+        pred = model(model_in, t, cond)
+        if float(cfg_scale) != 1.0:
+            uncond = model(model_in, t, None)
+            pred = uncond + float(cfg_scale) * (pred - uncond)
+
+        alpha = diffusion.alpha[t][:, None, None, None]
+        alpha_hat = diffusion.alpha_hat[t][:, None, None, None]
+        beta = diffusion.beta[t][:, None, None, None]
+        noise = torch.randn_like(x_img) if i > 1 else torch.zeros_like(x_img)
+        x_img = (1.0 / torch.sqrt(alpha)) * (x_img - ((1 - alpha) / torch.sqrt(1 - alpha_hat)) * pred) + torch.sqrt(beta) * noise
+
+    model.train()
+    return x_img
+
+
 def _seed_everything(seed: int):
     random.seed(seed)
     torch.manual_seed(seed)
@@ -85,7 +139,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         "--epochs",
         type=int,
         default=0,
-        help="Number of epochs. If 0, derive from --slices-per-cell and batch size.",
+        help="Number of epochs. If 0, derive from --slices-per-cell (training only).",
     )
     p.add_argument("--batch-size", type=int, default=8)
     p.add_argument("--lr", type=float, default=2e-4)
@@ -107,6 +161,26 @@ def main(argv: Optional[list[str]] = None) -> int:
         action="store_true",
         help="Show a per-epoch tqdm progress bar (useful for debugging long epochs).",
     )
+
+    # Optional qualitative sampling during training
+    p.add_argument(
+        "--sample-every",
+        type=int,
+        default=0,
+        help="If >0, generate qualitative samples every N epochs.",
+    )
+    p.add_argument(
+        "--sample-n",
+        type=int,
+        default=2,
+        help="How many samples to generate per validation condition.",
+    )
+    p.add_argument(
+        "--sample-cfg-scale",
+        type=float,
+        default=1.0,
+        help="CFG scale used for qualitative sampling.",
+    )
     args = p.parse_args(argv)
 
     _seed_everything(int(args.seed))
@@ -120,6 +194,11 @@ def main(argv: Optional[list[str]] = None) -> int:
     else:
         run_dir = args.run_dir
     os.makedirs(run_dir, exist_ok=True)
+
+    weights_dir = os.path.join(run_dir, "weights")
+    val_pictures_dir = os.path.join(run_dir, "val_pictures")
+    os.makedirs(weights_dir, exist_ok=True)
+    os.makedirs(val_pictures_dir, exist_ok=True)
 
     # Save run config.
     with open(os.path.join(run_dir, "run_config.json"), "w", encoding="utf-8") as f:
@@ -139,26 +218,45 @@ def main(argv: Optional[list[str]] = None) -> int:
         pad_to_batch=True,
     )
 
-    # Validation/test: also cell-based for speed. We evaluate deterministically on the
-    # same K slices per cell (K = slices_per_cell) each time.
-    val_ds = BatteryCTPerCellDataset(
-        args.index,
-        args.geometry,
-        splits_json=args.splits,
-        split="val",
-        batch_size=int(args.batch_size),
-        seed=int(args.seed),
-        pad_to_batch=False,
-    )
-    test_ds = BatteryCTPerCellDataset(
-        args.index,
-        args.geometry,
-        splits_json=args.splits,
-        split="test",
-        batch_size=int(args.batch_size),
-        seed=int(args.seed),
-        pad_to_batch=False,
-    )
+    # Validation/test: small cell-format coverage subset.
+    # We pick 1 cell per format and a mid-depth slice for each.
+    def _select_mid_slice_per_format(split_name: str) -> list[dict]:
+        with open(args.splits, "r", encoding="utf-8") as f:
+            splits = json.load(f)
+        with open(args.index, "r", encoding="utf-8") as f:
+            index = json.load(f)
+
+        allowed_cells = set(splits[f"{split_name}_cells"])
+        # Build cell -> (format, images)
+        cell_infos = {}
+        for cid, info in index["cells"].items():
+            if cid in allowed_cells:
+                cell_infos[cid] = info
+
+        chosen = []
+        for fmt in ["18650", "2170", "4680"]:
+            # choose first cell that matches format
+            candidates = [cid for cid, info in cell_infos.items() if str(info.get("cell_format", "")) == fmt]
+            if not candidates:
+                continue
+            cid = sorted(candidates)[0]
+            imgs = list(cell_infos[cid].get("images", []))
+            if not imgs:
+                continue
+            # pick mid depth (closest to 0.5)
+            mid = min(imgs, key=lambda d: abs(float(d.get("rel_depth", 0.0)) - 0.5))
+            chosen.append({"cell_id": cid, "relpath": mid["relpath"], "rel_depth": float(mid.get("rel_depth", 0.0))})
+        return chosen
+
+    val_samples = _select_mid_slice_per_format("val")
+    test_samples = _select_mid_slice_per_format("test")
+    if not val_samples:
+        raise RuntimeError("No validation samples selected. Check that val split contains 18650/2170/4680 cells.")
+    if not test_samples:
+        raise RuntimeError("No test samples selected. Check that test split contains 18650/2170/4680 cells.")
+
+    val_ds = BatteryCTSelectedSamplesDataset(args.index, args.geometry, samples=val_samples)
+    test_ds = BatteryCTSelectedSamplesDataset(args.index, args.geometry, samples=test_samples)
 
     # Derive epoch count if not explicitly set.
     if int(args.epochs) <= 0:
@@ -209,33 +307,22 @@ def main(argv: Optional[list[str]] = None) -> int:
     def run_eval(loader: DataLoader, use_ema: bool = False) -> float:
         net = ema_model if use_ema else model
         net.eval()
-        k = int(args.slices_per_cell)
-        if k < 1:
-            raise ValueError("--slices-per-cell must be >= 1")
-
-        # Evaluate on the same K slice choices per cell each time (set_epoch = 1..K).
-        # Note: deterministic cycling is most reliable with num_workers=0.
         total = 0.0
         count = 0
         with torch.no_grad():
-            for kk in range(1, k + 1):
-                if hasattr(loader.dataset, "set_epoch"):
-                    loader.dataset.set_epoch(kk)
-
-                for x, cond, mask in loader:
-                    bs = int(x.shape[0])
-                    x = x.to(device)
-                    mask = mask.to(device)
-                    cat, cont = cond
-                    cat = cat.to(device)
-                    cont = cont.to(device)
-                    t = diffusion.sample_timesteps(bs, device=device)
-                    x_t, noise = diffusion.noise_images(x, t)
-                    pred = net(x_t, t, (cat, cont))
-                    loss = masked_mse(pred, noise, mask).item()
-                    total += float(loss) * bs
-                    count += bs
-
+            for x, cond, mask in loader:
+                bs = int(x.shape[0])
+                x = x.to(device)
+                mask = mask.to(device)
+                cat, cont = cond
+                cat = cat.to(device)
+                cont = cont.to(device)
+                t = diffusion.sample_timesteps(bs, device=device)
+                x_t, noise = diffusion.noise_images(x, t)
+                pred = net(x_t, t, (cat, cont))
+                loss = masked_mse(pred, noise, mask).item()
+                total += float(loss) * bs
+                count += bs
         net.train()
         return float(total / max(1, count))
 
@@ -298,6 +385,67 @@ def main(argv: Optional[list[str]] = None) -> int:
         val_loss = run_eval(val_loader, use_ema=True)
         print(f"Epoch {epoch:04d} | train_loss={train_loss:.6f} | val_loss(ema)={val_loss:.6f}")
 
+        # Save validation pictures (polar images) for the selected validation samples.
+        # We save the un-noised input image channel for quick visual sanity checks.
+        if cv2 is not None:
+            try:
+                with torch.no_grad():
+                    for j, (vx, _vcond, _vmask) in enumerate(val_loader):
+                        imgs = vx[:, 0].cpu().numpy()
+                        for k in range(imgs.shape[0]):
+                            img = ((imgs[k] + 1.0) * 0.5 * 255.0).clip(0, 255).astype("uint8")
+                            outp = os.path.join(val_pictures_dir, f"epoch_{epoch:04d}_val_{j:02d}_{k:02d}.png")
+                            cv2.imwrite(outp, img)
+            except Exception:
+                pass
+
+        # Qualitative sampling (generate synthetic samples for fixed validation conditions).
+        if int(args.sample_every) > 0 and (epoch % int(args.sample_every) == 0):
+            if cv2 is None:
+                warnings.warn("cv2 not available; skipping qualitative sampling.")
+            else:
+                samples_dir = os.path.join(run_dir, "samples_training", f"epoch_{epoch:04d}")
+                os.makedirs(samples_dir, exist_ok=True)
+                try:
+                    with torch.no_grad():
+                        ema_model.eval()
+                        # Use the selected validation samples (one per format) as fixed conditions.
+                        for ci, (vx, vcond, vmask) in enumerate(val_loader):
+                            cat, cont = vcond
+                            cat = cat.to(device)
+                            cont = cont.to(device)
+                            cond_fixed = (
+                                cat[:1].expand(int(args.sample_n), -1),
+                                cont[:1].expand(int(args.sample_n), -1),
+                            )
+                            gen = sample_with_mask(
+                                diffusion=diffusion,
+                                model=ema_model,
+                                n=int(args.sample_n),
+                                cond=cond_fixed,
+                                mask=vmask[:1],
+                                device=device,
+                                cfg_scale=float(args.sample_cfg_scale),
+                            )
+                            gen_u8 = _to_uint8(gen[:, 0].cpu())
+                            for si in range(gen_u8.shape[0]):
+                                outp = os.path.join(samples_dir, f"cond_{ci:02d}_sample_{si:02d}.png")
+                                cv2.imwrite(outp, gen_u8[si].numpy())
+
+                        # Write sampling metadata once per epoch.
+                        meta = {
+                            "epoch": int(epoch),
+                            "sample_every": int(args.sample_every),
+                            "sample_n": int(args.sample_n),
+                            "sample_cfg_scale": float(args.sample_cfg_scale),
+                            "checkpoint_best_path": os.path.join(run_dir, "checkpoint_best.pt"),
+                            "val_selected_samples": val_samples,
+                        }
+                        with open(os.path.join(samples_dir, "metadata.json"), "w", encoding="utf-8") as f:
+                            json.dump(meta, f, indent=2)
+                except Exception as e:
+                    warnings.warn(f"Qualitative sampling failed: {e}")
+
         # Save best + periodic checkpoints
         if val_loss < best_val:
             best_val = val_loss
@@ -313,7 +461,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                 ckpt_path,
             )
         if int(args.save_every) > 0 and (epoch % int(args.save_every) == 0):
-            ckpt_path = os.path.join(run_dir, f"checkpoint_epoch_{epoch:04d}.pt")
+            ckpt_path = os.path.join(weights_dir, f"checkpoint_epoch_{epoch:04d}.pt")
             torch.save(
                 {
                     "epoch": epoch,
