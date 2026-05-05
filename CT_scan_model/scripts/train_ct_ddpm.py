@@ -14,6 +14,7 @@ Run (PowerShell, with venv):
 from __future__ import annotations
 
 import argparse
+import csv
 import datetime as _dt
 import json
 import os
@@ -37,7 +38,11 @@ except Exception:  # pragma: no cover
 
 import math
 
-from ..dataset_ct_polar import BatteryCTPerCellDataset, BatteryCTSelectedSamplesDataset
+from ..dataset_ct_polar import (
+    BatteryCTPerCellDataset,
+    BatteryCTSelectedSamplesDataset,
+    BatteryCTUniformCellsMaxPicturesDataset,
+)
 from ..diffusion_polar import Diffusion
 from ..modules_polar_ct import UNet_conditional_polar
 
@@ -123,6 +128,23 @@ def _seed_everything(seed: int):
     torch.cuda.manual_seed_all(seed)
 
 
+def _append_csv_row(path: str, header: list[str], row: list) -> None:
+    """Append a row to a CSV file, creating it (with header) if needed."""
+    file_exists = os.path.exists(path)
+    with open(path, "a", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        if not file_exists:
+            w.writerow(header)
+        w.writerow(row)
+        # Make sure content is visible on disk during training.
+        f.flush()
+        try:
+            os.fsync(f.fileno())
+        except OSError:
+            # Some filesystems may not support fsync.
+            pass
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     p = argparse.ArgumentParser(description="Train polar CT DDPM (single GPU).")
     p.add_argument("--index", default=os.path.join("model", "CT_scan_model", "cell_index.json"))
@@ -145,6 +167,21 @@ def main(argv: Optional[list[str]] = None) -> int:
     p.add_argument("--lr", type=float, default=2e-4)
     p.add_argument("--accumulation-steps", type=int, default=1)
     p.add_argument("--num-workers", type=int, default=0)
+
+    # Picture-budget training (optional)
+    p.add_argument(
+        "--max-pictures",
+        type=int,
+        default=0,
+        help="If >0, train for a fixed number of seen pictures (rounded up to batch-size) with global-uniform cell sampling.",
+    )
+    p.add_argument(
+        "--val-every-pictures",
+        type=int,
+        default=0,
+        help="Validate every N seen pictures. If 0, validate only at the end.",
+    )
+    p.add_argument("--no-ema-val", action="store_true", help="Use raw model for validation instead of EMA")
 
     p.add_argument("--noise-steps", type=int, default=1000)
     p.add_argument("--beta-start", type=float, default=1e-4)
@@ -200,6 +237,11 @@ def main(argv: Optional[list[str]] = None) -> int:
     os.makedirs(weights_dir, exist_ok=True)
     os.makedirs(val_pictures_dir, exist_ok=True)
 
+    # Loss logs
+    epoch_loss_csv = os.path.join(run_dir, "loss_per_epoch.csv")
+    batch_loss_csv = os.path.join(run_dir, "loss_per_batch.csv")
+    val_loss_csv = os.path.join(run_dir, "loss_per_val.csv")
+
     # Save run config.
     with open(os.path.join(run_dir, "run_config.json"), "w", encoding="utf-8") as f:
         json.dump(vars(args), f, indent=2)
@@ -207,16 +249,36 @@ def main(argv: Optional[list[str]] = None) -> int:
     if int(args.slices_per_cell) < 1:
         raise ValueError("--slices-per-cell must be >= 1")
 
-    # Cell-level training dataset (one sample per cell per epoch).
-    train_ds = BatteryCTPerCellDataset(
-        args.index,
-        args.geometry,
-        splits_json=args.splits,
-        split="train",
-        batch_size=int(args.batch_size),
-        seed=int(args.seed),
-        pad_to_batch=True,
-    )
+    # Training dataset.
+    if int(args.max_pictures) > 0:
+        # Round up to full batches.
+        bs = int(args.batch_size)
+        if bs < 1:
+            raise ValueError("--batch-size must be >= 1")
+        max_pics_rounded = int(((int(args.max_pictures) + bs - 1) // bs) * bs)
+        train_ds = BatteryCTUniformCellsMaxPicturesDataset(
+            args.index,
+            args.geometry,
+            splits_json=args.splits,
+            split="train",
+            max_pictures=max_pics_rounded,
+            seed=int(args.seed),
+        )
+        print(
+            f"Picture-budget mode: max_pictures={int(args.max_pictures)} -> rounded={max_pics_rounded} "
+            f"(batch_size={bs}, train_cells={len(train_ds.cell_ids)})"
+        )
+    else:
+        # Cell-level training dataset (one sample per cell per epoch).
+        train_ds = BatteryCTPerCellDataset(
+            args.index,
+            args.geometry,
+            splits_json=args.splits,
+            split="train",
+            batch_size=int(args.batch_size),
+            seed=int(args.seed),
+            pad_to_batch=True,
+        )
 
     # Validation/test: small cell-format coverage subset.
     # We pick 1 cell per format and a mid-depth slice for each.
@@ -258,10 +320,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     val_ds = BatteryCTSelectedSamplesDataset(args.index, args.geometry, samples=val_samples)
     test_ds = BatteryCTSelectedSamplesDataset(args.index, args.geometry, samples=test_samples)
 
-    # Derive epoch count if not explicitly set.
-    if int(args.epochs) <= 0:
-        # Epoch = one pass over (padded) train cells. We cycle one slice per cell
-        # per epoch, so seeing K distinct slices per cell implies K epochs.
+    # Derive epoch count if not explicitly set (only used in epoch-based mode).
+    if int(args.max_pictures) <= 0 and int(args.epochs) <= 0:
         args.epochs = int(args.slices_per_cell)
         print(
             "Derived epochs:",
@@ -272,7 +332,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     train_loader = DataLoader(
         train_ds,
         batch_size=int(args.batch_size),
-        shuffle=True,
+        shuffle=(int(args.max_pictures) <= 0),
         num_workers=int(args.num_workers),
         pin_memory=torch.cuda.is_available(),
     )
@@ -328,13 +388,12 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     # Training
     best_val = float("inf")
-    for epoch in range(1, int(args.epochs) + 1):
-        # Ensure per-cell slice selection changes each epoch.
-        train_ds.set_epoch(epoch)
-        model.train()
-        optimizer.zero_grad(set_to_none=True)
 
-        running = 0.0
+    if int(args.max_pictures) > 0:
+        # Picture-budget mode: validate every N seen pictures.
+        pictures_seen = 0
+        next_val_at = int(args.val_every_pictures) if int(args.val_every_pictures) > 0 else None
+        last_val_loss: Optional[float] = None
 
         use_tqdm = (bool(args.tqdm) or sys.stderr.isatty()) and tqdm is not None
         if bool(args.tqdm) and tqdm is None:
@@ -343,17 +402,21 @@ def main(argv: Optional[list[str]] = None) -> int:
         train_iter = train_loader
         pbar = None
         if use_tqdm:
-            pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{int(args.epochs)}", unit="batch", leave=False)
+            total_batches = len(train_loader)
+            pbar = tqdm(train_loader, desc="Training (max_pictures)", unit="batch", total=total_batches, leave=False)
             train_iter = pbar
 
-        for step, (x, cond, mask) in enumerate(train_iter, start=1):
+        model.train()
+        optimizer.zero_grad(set_to_none=True)
+        running = 0.0
+        batch_idx = 0
+        for batch_idx, (x, cond, mask) in enumerate(train_iter, start=1):
             x = x.to(device)
             mask = mask.to(device)
             cat, cont = cond
             cat = cat.to(device)
             cont = cont.to(device)
 
-            # CFG training: randomly drop conditioning.
             if float(args.p_uncond) > 0 and random.random() < float(args.p_uncond):
                 cond_in = None
             else:
@@ -364,130 +427,275 @@ def main(argv: Optional[list[str]] = None) -> int:
 
             with torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):
                 pred = model(x_t, t, cond_in)
-                loss = masked_mse(pred, noise, mask)
-                loss = loss / max(1, int(args.accumulation_steps))
+                loss_raw = masked_mse(pred, noise, mask)
+                loss = loss_raw / max(1, int(args.accumulation_steps))
 
             scaler.scale(loss).backward()
 
-            if step % max(1, int(args.accumulation_steps)) == 0:
+            if batch_idx % max(1, int(args.accumulation_steps)) == 0:
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad(set_to_none=True)
                 ema.step_ema(ema_model, model, step_start_ema=0)
 
             running += float(loss.item())
+            pictures_seen += int(x.shape[0])
+
+            _append_csv_row(
+                batch_loss_csv,
+                header=["pictures_seen", "batch", "train_loss"],
+                row=[int(pictures_seen), int(batch_idx), float(loss_raw.detach().item())],
+            )
 
             if pbar is not None:
-                # Show the *unscaled* (per-step) loss.
-                pbar.set_postfix({"loss": f"{float(loss.item()):.4f}"})
+                pbar.set_postfix({"loss": f"{float(loss.item()):.4f}", "pics": int(pictures_seen)})
+
+            if next_val_at is not None and pictures_seen >= int(next_val_at):
+                # Handle potential multiple missed intervals.
+                while next_val_at is not None and pictures_seen >= int(next_val_at):
+                    val_loss = run_eval(val_loader, use_ema=(not bool(args.no_ema_val)))
+                    last_val_loss = float(val_loss)
+                    if val_loss < best_val:
+                        best_val = float(val_loss)
+                        ckpt_path = os.path.join(run_dir, "checkpoint_best.pt")
+                        torch.save(
+                            {
+                                "epoch": 0,
+                                "pictures_seen": int(pictures_seen),
+                                "model": model.state_dict(),
+                                "ema_model": ema_model.state_dict(),
+                                "optimizer": optimizer.state_dict(),
+                                "best_val": best_val,
+                            },
+                            ckpt_path,
+                        )
+                    _append_csv_row(
+                        val_loss_csv,
+                        header=["pictures_seen", "val_loss", "best_val", "use_ema_val"],
+                        row=[int(pictures_seen), float(val_loss), float(best_val), (not bool(args.no_ema_val))],
+                    )
+                    next_val_at = int(next_val_at) + int(args.val_every_pictures)
+
+        # Final validation at end (required when val_every_pictures==0).
+        if next_val_at is None:
+            val_loss = run_eval(val_loader, use_ema=(not bool(args.no_ema_val)))
+            last_val_loss = float(val_loss)
+            if val_loss < best_val:
+                best_val = float(val_loss)
+                ckpt_path = os.path.join(run_dir, "checkpoint_best.pt")
+                torch.save(
+                    {
+                        "epoch": 0,
+                        "pictures_seen": int(pictures_seen),
+                        "model": model.state_dict(),
+                        "ema_model": ema_model.state_dict(),
+                        "optimizer": optimizer.state_dict(),
+                        "best_val": best_val,
+                    },
+                    ckpt_path,
+                )
+            _append_csv_row(
+                val_loss_csv,
+                header=["pictures_seen", "val_loss", "best_val", "use_ema_val"],
+                row=[int(pictures_seen), float(val_loss), float(best_val), (not bool(args.no_ema_val))],
+            )
 
         train_loss = running / max(1, len(train_loader))
-        val_loss = run_eval(val_loader, use_ema=True)
-        print(f"Epoch {epoch:04d} | train_loss={train_loss:.6f} | val_loss(ema)={val_loss:.6f}")
+        val_loss_summary = float(last_val_loss) if last_val_loss is not None else float(best_val)
+        _append_csv_row(
+            epoch_loss_csv,
+            header=["epoch", "train_loss", "val_loss", "best_val"],
+            row=[0, float(train_loss), float(val_loss_summary), float(best_val)],
+        )
+        print(
+            f"Done (max_pictures): pics={pictures_seen} | train_loss={train_loss:.6f} | best_val={best_val:.6f}"
+        )
+    else:
+        # Epoch-based mode (original behavior)
+        for epoch in range(1, int(args.epochs) + 1):
+            train_ds.set_epoch(epoch)
+            model.train()
+            optimizer.zero_grad(set_to_none=True)
 
-        # Save validation pictures (polar images) for the selected validation samples.
-        # We save the un-noised input image channel for quick visual sanity checks.
-        if cv2 is not None:
-            try:
-                with torch.no_grad():
-                    for j, (vx, _vcond, _vmask) in enumerate(val_loader):
-                        imgs = vx[:, 0].cpu().numpy()
-                        for k in range(imgs.shape[0]):
-                            img = ((imgs[k] + 1.0) * 0.5 * 255.0).clip(0, 255).astype("uint8")
-                            outp = os.path.join(val_pictures_dir, f"epoch_{epoch:04d}_val_{j:02d}_{k:02d}.png")
-                            cv2.imwrite(outp, img)
-            except Exception:
-                pass
+            running = 0.0
 
-        # Qualitative sampling (generate synthetic samples for fixed validation conditions).
-        if int(args.sample_every) > 0 and (epoch % int(args.sample_every) == 0):
-            if cv2 is None:
-                warnings.warn("cv2 not available; skipping qualitative sampling.")
-            else:
-                samples_dir = os.path.join(run_dir, "samples_training", f"epoch_{epoch:04d}")
-                os.makedirs(samples_dir, exist_ok=True)
+            use_tqdm = (bool(args.tqdm) or sys.stderr.isatty()) and tqdm is not None
+            if bool(args.tqdm) and tqdm is None:
+                raise RuntimeError("tqdm is not installed but --tqdm was requested. Install via: pip install tqdm")
+
+            train_iter = train_loader
+            pbar = None
+            if use_tqdm:
+                pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{int(args.epochs)}", unit="batch", leave=False)
+                train_iter = pbar
+
+            for step, (x, cond, mask) in enumerate(train_iter, start=1):
+                x = x.to(device)
+                mask = mask.to(device)
+                cat, cont = cond
+                cat = cat.to(device)
+                cont = cont.to(device)
+
+                if float(args.p_uncond) > 0 and random.random() < float(args.p_uncond):
+                    cond_in = None
+                else:
+                    cond_in = (cat, cont)
+
+                t = diffusion.sample_timesteps(x.shape[0], device=device)
+                x_t, noise = diffusion.noise_images(x, t)
+
+                with torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):
+                    pred = model(x_t, t, cond_in)
+                    loss_raw = masked_mse(pred, noise, mask)
+                    loss = loss_raw / max(1, int(args.accumulation_steps))
+
+                scaler.scale(loss).backward()
+
+                if step % max(1, int(args.accumulation_steps)) == 0:
+                    scaler.step(optimizer)
+                    scaler.update()
+                    optimizer.zero_grad(set_to_none=True)
+                    ema.step_ema(ema_model, model, step_start_ema=0)
+
+                running += float(loss.item())
+
+                _append_csv_row(
+                    batch_loss_csv,
+                    header=["epoch", "batch", "train_loss"],
+                    row=[int(epoch), int(step), float(loss_raw.detach().item())],
+                )
+
+                if pbar is not None:
+                    pbar.set_postfix({"loss": f"{float(loss.item()):.4f}"})
+
+            train_loss = running / max(1, len(train_loader))
+            val_loss = run_eval(val_loader, use_ema=(not bool(args.no_ema_val)))
+            print(
+                f"Epoch {epoch:04d} | train_loss={train_loss:.6f} | val_loss({'ema' if not bool(args.no_ema_val) else 'raw'})={val_loss:.6f}"
+            )
+
+            # Save validation pictures (polar images) for the selected validation samples.
+            # We save the un-noised input image channel for quick visual sanity checks.
+            if cv2 is not None:
                 try:
                     with torch.no_grad():
-                        ema_model.eval()
-                        # Use the selected validation samples (one per format) as fixed conditions.
-                        cond_entries = []
-                        for ci, (vx, vcond, vmask) in enumerate(val_loader):
-                            cat, cont = vcond
-                            cat = cat.to(device)
-                            cont = cont.to(device)
-                            cond_fixed = (
-                                cat[:1].expand(int(args.sample_n), -1),
-                                cont[:1].expand(int(args.sample_n), -1),
-                            )
+                        for j, (vx, _vcond, _vmask) in enumerate(val_loader):
+                            imgs = vx[:, 0].cpu().numpy()
+                            for k in range(imgs.shape[0]):
+                                img = ((imgs[k] + 1.0) * 0.5 * 255.0).clip(0, 255).astype("uint8")
+                                outp = os.path.join(val_pictures_dir, f"epoch_{epoch:04d}_val_{j:02d}_{k:02d}.png")
+                                cv2.imwrite(outp, img)
+                except Exception:
+                    pass
 
-                            # Record the exact conditioning used for this cond index.
-                            cond_entries.append(
-                                {
-                                    "cond_index": int(ci),
-                                    "cat_ids": cat[:1].detach().cpu().tolist()[0],
-                                    "cont": cont[:1].detach().cpu().tolist()[0],
-                                }
-                            )
-                            gen = sample_with_mask(
-                                diffusion=diffusion,
-                                model=ema_model,
-                                n=int(args.sample_n),
-                                cond=cond_fixed,
-                                mask=vmask[:1],
-                                device=device,
-                                cfg_scale=float(args.sample_cfg_scale),
-                            )
-                            gen_u8 = _to_uint8(gen[:, 0].cpu())
-                            for si in range(gen_u8.shape[0]):
-                                outp = os.path.join(samples_dir, f"cond_{ci:02d}_sample_{si:02d}.png")
-                                cv2.imwrite(outp, gen_u8[si].numpy())
+            # Qualitative sampling (generate synthetic samples for fixed validation conditions).
+            if int(args.sample_every) > 0 and (epoch % int(args.sample_every) == 0):
+                if cv2 is None:
+                    warnings.warn("cv2 not available; skipping qualitative sampling.")
+                else:
+                    samples_dir = os.path.join(run_dir, "samples_training", f"epoch_{epoch:04d}")
+                    os.makedirs(samples_dir, exist_ok=True)
+                    try:
+                        with torch.no_grad():
+                            ema_model.eval()
+                            # Use the selected validation samples (one per format) as fixed conditions.
+                            cond_entries = []
+                            for ci, (vx, vcond, vmask) in enumerate(val_loader):
+                                cat, cont = vcond
+                                cat = cat.to(device)
+                                cont = cont.to(device)
+                                cond_fixed = (
+                                    cat[:1].expand(int(args.sample_n), -1),
+                                    cont[:1].expand(int(args.sample_n), -1),
+                                )
 
-                        # Write sampling metadata once per epoch.
-                        meta = {
-                            "epoch": int(epoch),
-                            "sample_every": int(args.sample_every),
-                            "sample_n": int(args.sample_n),
-                            "sample_cfg_scale": float(args.sample_cfg_scale),
-                            "checkpoint_best_path": os.path.join(run_dir, "checkpoint_best.pt"),
-                            "val_selected_samples": val_samples,
-                            "sampling_conditions": cond_entries,
-                        }
-                        with open(os.path.join(samples_dir, "metadata.json"), "w", encoding="utf-8") as f:
-                            json.dump(meta, f, indent=2)
-                except Exception as e:
-                    warnings.warn(f"Qualitative sampling failed: {e}")
+                                # Record the exact conditioning used for this cond index.
+                                cond_entries.append(
+                                    {
+                                        "cond_index": int(ci),
+                                        "cat_ids": cat[:1].detach().cpu().tolist()[0],
+                                        "cont": cont[:1].detach().cpu().tolist()[0],
+                                    }
+                                )
+                                gen = sample_with_mask(
+                                    diffusion=diffusion,
+                                    model=ema_model,
+                                    n=int(args.sample_n),
+                                    cond=cond_fixed,
+                                    mask=vmask[:1],
+                                    device=device,
+                                    cfg_scale=float(args.sample_cfg_scale),
+                                )
+                                gen_u8 = _to_uint8(gen[:, 0].cpu())
+                                for si in range(gen_u8.shape[0]):
+                                    outp = os.path.join(samples_dir, f"cond_{ci:02d}_sample_{si:02d}.png")
+                                    cv2.imwrite(outp, gen_u8[si].numpy())
 
-        # Save best + periodic checkpoints
-        if val_loss < best_val:
-            best_val = val_loss
-            ckpt_path = os.path.join(run_dir, "checkpoint_best.pt")
-            torch.save(
-                {
-                    "epoch": epoch,
-                    "model": model.state_dict(),
-                    "ema_model": ema_model.state_dict(),
-                    "optimizer": optimizer.state_dict(),
-                    "best_val": best_val,
-                },
-                ckpt_path,
+                            # Write sampling metadata once per epoch.
+                            meta = {
+                                "epoch": int(epoch),
+                                "sample_every": int(args.sample_every),
+                                "sample_n": int(args.sample_n),
+                                "sample_cfg_scale": float(args.sample_cfg_scale),
+                                "checkpoint_best_path": os.path.join(run_dir, "checkpoint_best.pt"),
+                                "val_selected_samples": val_samples,
+                                "sampling_conditions": cond_entries,
+                            }
+                            with open(os.path.join(samples_dir, "metadata.json"), "w", encoding="utf-8") as f:
+                                json.dump(meta, f, indent=2)
+                    except Exception as e:
+                        warnings.warn(f"Qualitative sampling failed: {e}")
+
+            # Save best + periodic checkpoints
+            if val_loss < best_val:
+                best_val = val_loss
+                ckpt_path = os.path.join(run_dir, "checkpoint_best.pt")
+                torch.save(
+                    {
+                        "epoch": epoch,
+                        "model": model.state_dict(),
+                        "ema_model": ema_model.state_dict(),
+                        "optimizer": optimizer.state_dict(),
+                        "best_val": best_val,
+                    },
+                    ckpt_path,
+                )
+
+            # Epoch loss logging
+            _append_csv_row(
+                epoch_loss_csv,
+                header=["epoch", "train_loss", "val_loss", "best_val"],
+                row=[int(epoch), float(train_loss), float(val_loss), float(best_val)],
             )
-        if int(args.save_every) > 0 and (epoch % int(args.save_every) == 0):
-            ckpt_path = os.path.join(weights_dir, f"checkpoint_epoch_{epoch:04d}.pt")
-            torch.save(
-                {
-                    "epoch": epoch,
-                    "model": model.state_dict(),
-                    "ema_model": ema_model.state_dict(),
-                    "optimizer": optimizer.state_dict(),
-                    "best_val": best_val,
-                },
-                ckpt_path,
-            )
+            if int(args.save_every) > 0 and (epoch % int(args.save_every) == 0):
+                ckpt_path = os.path.join(weights_dir, f"checkpoint_epoch_{epoch:04d}.pt")
+                torch.save(
+                    {
+                        "epoch": epoch,
+                        "model": model.state_dict(),
+                        "ema_model": ema_model.state_dict(),
+                        "optimizer": optimizer.state_dict(),
+                        "best_val": best_val,
+                    },
+                    ckpt_path,
+                )
 
-    test_loss = run_eval(test_loader, use_ema=True)
+    use_ema_val = not bool(args.no_ema_val)
+    test_loss = run_eval(test_loader, use_ema=use_ema_val)
     with open(os.path.join(run_dir, "final_metrics.json"), "w", encoding="utf-8") as f:
-        json.dump({"test_loss_ema": test_loss, "best_val_ema": best_val}, f, indent=2)
-    print(f"Test loss (EMA): {test_loss:.6f}")
+        json.dump(
+            {
+                "test_loss": test_loss,
+                "best_val": best_val,
+                "use_ema_val": bool(use_ema_val),
+                # Backwards-compatible keys
+                "test_loss_ema": test_loss if use_ema_val else None,
+                "best_val_ema": best_val if use_ema_val else None,
+            },
+            f,
+            indent=2,
+        )
+    print(f"Test loss ({'ema' if use_ema_val else 'raw'}): {test_loss:.6f}")
     print(f"Run dir: {run_dir}")
     return 0
 
