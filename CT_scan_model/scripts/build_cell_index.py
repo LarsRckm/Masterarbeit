@@ -17,7 +17,7 @@ Outputs a JSON file that is later consumed by:
 
 Run (PowerShell, with venv):
   . "C:/Users/larsr/Documents/PythonVenv/Scripts/Activate.ps1"; \
-  python -m model.CT_scan_model.scripts.build_cell_index --out model/CT_scan_model/cell_index.json
+  python -m CT_scan_model.scripts.build_cell_index --out CT_scan_model/cell_index.json
 """
 
 from __future__ import annotations
@@ -131,11 +131,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--base-path", default=config.BASE_PATH, help="Dataset BASE_PATH (default: model.config.BASE_PATH)")
     p.add_argument("--min-rel-depth", type=float, default=0.1)
     p.add_argument("--max-rel-depth", type=float, default=0.9)
-    p.add_argument(
-        "--out",
-        default=os.path.join("model", "CT_scan_model", "cell_index.json"),
-        help="Output JSON path",
-    )
+    p.add_argument("--out", default=os.path.join("CT_scan_model", "cell_index.json"), help="Output JSON path")
     args = p.parse_args(argv)
 
     index = build_index(args.base_path, min_rel_depth=args.min_rel_depth, max_rel_depth=args.max_rel_depth)

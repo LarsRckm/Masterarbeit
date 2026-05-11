@@ -1,15 +1,14 @@
-"""Sample synthetic polar CT images from a trained DDPM.
+"""Sample synthetic cartesian CT images from a trained DDPM.
 
 This script generates images from pure noise, conditioned on the same
 categorical/continuous conditions used during training.
 
 Outputs:
-- Polar PNGs (R x Theta)
-- Optional Cartesian PNGs via inverse remap (centered)
+- Cartesian PNGs (CARTESIAN_SIZE x CARTESIAN_SIZE)
 
 Run (PowerShell, with venv):
   . "C:/Users/larsr/Documents/PythonVenv/Scripts/Activate.ps1"; \
-  python -m model.CT_scan_model.scripts.sample_ct_ddpm \
+  python -m CT_scan_model.scripts.sample_ct_ddpm \
     --ckpt runs/ct_scan_model/<timestamp>/checkpoint_best.pt \
     --outdir runs/ct_scan_model/<timestamp>/samples \
     --n 8 \
@@ -27,11 +26,8 @@ from __future__ import annotations
 import argparse
 import difflib
 import json
-import math
 import os
 import random
-import sys
-import warnings
 from typing import List, Optional
 
 import numpy as np
@@ -47,8 +43,8 @@ try:
 except ImportError:  # pragma: no cover
     import config as project_config  # type: ignore
 
-from ..diffusion_polar import Diffusion
-from ..modules_polar_ct import UNet_conditional_polar
+from ..diffusion_cartesian import Diffusion
+from ..modules_cartesian_ct import UNet_conditional_cartesian
 
 
 def _seed_everything(seed: int) -> None:
@@ -106,55 +102,35 @@ def _to_uint8(img: np.ndarray) -> np.ndarray:
     return np.clip(x, 0, 255).astype(np.uint8)
 
 
-def _build_polar_mask(n: int, r_model: int, theta_bins: int, r_valid_rel: float, device: torch.device) -> tuple[torch.Tensor, int]:
-    r_use = int(round(float(r_valid_rel) * float(r_model)))
-    r_use = max(1, min(int(r_model), r_use))
-    x_mask = torch.zeros((n, 1, r_model, theta_bins), device=device, dtype=torch.float32)
-    x_mask[:, :, :r_use, :] = 1.0
-    return x_mask, r_use
+def _build_circle_mask(n: int, size: int, r_valid_rel: float, device: torch.device) -> tuple[torch.Tensor, float]:
+    r = float(r_valid_rel) * (float(size) / 2.0)
+    r = max(1.0, min(float(size) / 2.0, r))
+
+    cx = (float(size) - 1.0) / 2.0
+    cy = (float(size) - 1.0) / 2.0
+    ys = torch.arange(size, device=device, dtype=torch.float32)[:, None]
+    xs = torch.arange(size, device=device, dtype=torch.float32)[None, :]
+    dist2 = (xs - cx) ** 2 + (ys - cy) ** 2
+    mask2d = (dist2 <= (r**2)).to(dtype=torch.float32)
+    x_mask = mask2d[None, None, :, :].expand(int(n), 1, size, size).contiguous()
+    return x_mask, r
 
 
-def _build_inverse_remap_maps(size: int, r_use_effective: int, theta_bins: int) -> tuple[np.ndarray, np.ndarray]:
-    if cv2 is None:
-        raise RuntimeError("OpenCV (cv2) is required for cartesian output via remap.")
+def _apply_padding_projection(x_img: torch.Tensor, x_mask: torch.Tensor, pad_value: float = 0.0) -> torch.Tensor:
+    """Project invalid/padded pixels (mask==0) to a fixed training padding value.
 
-    cx = (size - 1) / 2.0
-    cy = (size - 1) / 2.0
-
-    xs = np.arange(size, dtype=np.float32)
-    ys = np.arange(size, dtype=np.float32)
-    X, Y = np.meshgrid(xs, ys)
-    dx = X - cx
-    dy = Y - cy
-    r = np.sqrt(dx * dx + dy * dy)
-    theta = np.arctan2(dy, dx)
-    theta = np.where(theta < 0, theta + 2.0 * np.pi, theta)
-
-    map_x = (theta / (2.0 * np.pi)) * float(theta_bins)
-    map_x = np.mod(map_x, float(theta_bins)).astype(np.float32)
-    map_y = r.astype(np.float32)
-
-    outside = r > float(r_use_effective)
-    map_x[outside] = -1.0
-    map_y[outside] = -1.0
-    return map_x, map_y
+    Training uses image=0 outside the circle mask.
+    This projection helps prevent drift during sampling.
+    """
+    pad = torch.tensor(float(pad_value), device=x_img.device, dtype=x_img.dtype)
+    return x_img * x_mask + pad * (1.0 - x_mask)
 
 
-def _polar_to_cartesian_remap(polar: np.ndarray, map_x: np.ndarray, map_y: np.ndarray) -> np.ndarray:
-    if cv2 is None:
-        raise RuntimeError("OpenCV (cv2) is required for cartesian output via remap.")
-    return cv2.remap(
-        polar.astype(np.float32),
-        map_x,
-        map_y,
-        interpolation=cv2.INTER_LINEAR,
-        borderMode=cv2.BORDER_CONSTANT,
-        borderValue=0,
-    )
+## NOTE: In the cartesian approach we do not remap from polar.
 
 
 def main(argv: Optional[List[str]] = None) -> int:
-    p = argparse.ArgumentParser(description="Sample polar CT DDPM images from noise.")
+    p = argparse.ArgumentParser(description="Sample cartesian CT DDPM images from noise.")
     p.add_argument("--ckpt", required=True, help="Path to checkpoint (.pt)")
     p.add_argument("--outdir", required=True, help="Output directory")
     p.add_argument("--n", type=int, required=True, help="Number of samples")
@@ -168,21 +144,55 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--r-valid-rel", type=float, required=True)
 
     # Sampling
+    p.add_argument(
+        "--sampler",
+        choices=["ddpm", "ddim"],
+        default="ddpm",
+        help="Sampling method: 'ddpm' (default, full steps) or 'ddim' (fewer steps).",
+    )
     p.add_argument("--cfg-scale", type=float, default=1.0)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--noise-steps", type=int, default=1000)
     p.add_argument("--beta-start", type=float, default=1e-4)
     p.add_argument("--beta-end", type=float, default=0.02)
+    p.add_argument(
+        "--stochastic",
+        action="store_true",
+        help="Enable ancestral DDPM noise during reverse steps (default: deterministic).",
+    )
+    p.add_argument(
+        "--eta",
+        type=float,
+        default=1.0,
+        help=(
+            "Noise scale for stochastic sampling. 0.0 = deterministic, 1.0 = full DDPM noise. "
+            "Only used when --stochastic is set."
+        ),
+    )
+    p.add_argument(
+        "--ddim-steps",
+        type=int,
+        default=200,
+        help="Number of DDIM steps (used only when --sampler=ddim). Typical: 50-200.",
+    )
+    p.add_argument(
+        "--ddim-eta",
+        type=float,
+        default=0.0,
+        help="DDIM noise parameter eta. 0.0 = deterministic, >0 adds noise (used only with --sampler=ddim).",
+    )
+    p.add_argument(
+        "--pad-value",
+        type=float,
+        default=0.0,
+        help="Padding value in model space for mask==0. Default 0.0 matches training padding.",
+    )
     p.add_argument("--no-ema", action="store_true", help="Use raw model weights instead of EMA")
 
     # Output
-    p.add_argument("--save-polar", action="store_true", default=True)
-    p.add_argument("--no-save-polar", action="store_false", dest="save_polar")
     p.add_argument("--save-cartesian", action="store_true", default=True)
     p.add_argument("--no-save-cartesian", action="store_false", dest="save_cartesian")
-    p.add_argument("--cartesian-size", default="auto", help="'auto' or integer size")
-    p.add_argument("--cartesian-margin", type=int, default=4)
-    p.add_argument("--save-mask", action="store_true", help="Save the polar mask as PNG")
+    p.add_argument("--save-mask", action="store_true", help="Save the mask as PNG")
 
     args = p.parse_args(argv)
 
@@ -194,8 +204,13 @@ def main(argv: Optional[List[str]] = None) -> int:
         raise SystemExit("--r-valid-rel must be in (0,1]")
     if float(args.voxel_size_um) <= 0:
         raise SystemExit("--voxel-size-um must be > 0")
-    if int(args.cartesian_margin) < 0:
-        raise SystemExit("--cartesian-margin must be >= 0")
+    # (no cartesian size/margin args in this approach)
+    if float(args.eta) < 0:
+        raise SystemExit("--eta must be >= 0")
+    if int(args.ddim_steps) < 1:
+        raise SystemExit("--ddim-steps must be >= 1")
+    if float(args.ddim_eta) < 0:
+        raise SystemExit("--ddim-eta must be >= 0")
 
     cell_format = _require_in_vocab("cell-format", str(args.cell_format), project_config.CELL_FORMAT_VOCAB)
     manufacturer = _require_in_vocab("manufacturer", str(args.manufacturer), project_config.MANUFACTURER_VOCAB)
@@ -225,20 +240,18 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     # Load checkpoint.
     ckpt = torch.load(args.ckpt, map_location=device)
-    model = UNet_conditional_polar().to(device)
+    model = UNet_conditional_cartesian().to(device)
     key = "model" if bool(args.no_ema) else "ema_model"
     if key not in ckpt:
         raise SystemExit(f"Checkpoint missing key '{key}'. Available keys: {list(ckpt.keys())}")
     model.load_state_dict(ckpt[key])
     model.eval()
 
-    # Diffusion schedule.
     diffusion = Diffusion(noise_steps=int(args.noise_steps), beta_start=float(args.beta_start), beta_end=float(args.beta_end)).to(device)
-    r_model = int(project_config.POLAR_R_MODEL)
-    theta_bins = int(project_config.POLAR_THETA_BINS)
+    size = int(getattr(project_config, "CARTESIAN_SIZE", 1024))
 
-    # Build fixed mask from r-valid-rel.
-    x_mask, r_use = _build_polar_mask(int(args.n), r_model, theta_bins, float(args.r_valid_rel), device=device)
+    # Build fixed circular mask from r-valid-rel.
+    x_mask, r_px = _build_circle_mask(int(args.n), size, float(args.r_valid_rel), device=device)
 
     if bool(args.save_mask):
         if cv2 is None:
@@ -246,73 +259,87 @@ def main(argv: Optional[List[str]] = None) -> int:
         mask_np = (x_mask[0, 0].detach().cpu().numpy() * 255.0).astype(np.uint8)
         cv2.imwrite(os.path.join(args.outdir, "mask.png"), mask_np)
 
-    # Sampling loop (DDPM).
     with torch.no_grad():
-        x_img = torch.randn((int(args.n), 1, r_model, theta_bins), device=device)
-        for i in reversed(range(1, int(args.noise_steps))):
-            t = torch.full((int(args.n),), i, device=device, dtype=torch.long)
-            model_in = torch.cat([x_img, x_mask], dim=1)
-            pred = model(model_in, t, cond)
-            if float(args.cfg_scale) != 1.0:
-                uncond = model(model_in, t, None)
-                pred = uncond + float(args.cfg_scale) * (pred - uncond)
+        x_img = torch.randn((int(args.n), 1, size, size), device=device)
+        # Ensure padded region matches training representation from the start.
+        x_img = _apply_padding_projection(x_img, x_mask, pad_value=float(args.pad_value))
 
-            alpha = diffusion.alpha[t][:, None, None, None]
-            alpha_hat = diffusion.alpha_hat[t][:, None, None, None]
-            beta = diffusion.beta[t][:, None, None, None]
-            noise = torch.randn_like(x_img) if i > 1 else torch.zeros_like(x_img)
-            x_img = (1.0 / torch.sqrt(alpha)) * (x_img - ((1 - alpha) / torch.sqrt(1 - alpha_hat)) * pred) + torch.sqrt(beta) * noise
+        if str(args.sampler).lower() == "ddim":
+            # DDIM sampling: use a subsequence of timesteps, ending at t=1.
+            num_steps = int(args.ddim_steps)
+            skip = max(1, int(args.noise_steps) // num_steps)
+            seq = list(range(1, int(args.noise_steps), skip))
+            if seq[-1] != int(args.noise_steps) - 1:
+                seq.append(int(args.noise_steps) - 1)
+            if seq[0] != 1:
+                seq.insert(0, 1)
+
+            for si in range(len(seq) - 1, 0, -1):
+                t_i = int(seq[si])
+                t_next = int(seq[si - 1])
+
+                t = torch.full((int(args.n),), t_i, device=device, dtype=torch.long)
+                model_in = torch.cat([x_img, x_mask], dim=1)
+                pred = model(model_in, t, cond)
+                if float(args.cfg_scale) != 1.0:
+                    uncond = model(model_in, t, None)
+                    pred = uncond + float(args.cfg_scale) * (pred - uncond)
+
+                alpha_hat_t = diffusion.alpha_hat[t][:, None, None, None]
+                t_next_tensor = torch.full((int(args.n),), t_next, device=device, dtype=torch.long)
+                alpha_hat_next = diffusion.alpha_hat[t_next_tensor][:, None, None, None]
+
+                # Predict x0 from x_t and eps.
+                x0 = (x_img - torch.sqrt(1.0 - alpha_hat_t) * pred) / torch.sqrt(alpha_hat_t)
+
+                eta = float(args.ddim_eta)
+                sigma = eta * torch.sqrt(
+                    (1.0 - alpha_hat_next) / (1.0 - alpha_hat_t) * (1.0 - alpha_hat_t / alpha_hat_next)
+                )
+                if eta > 0.0:
+                    noise = torch.randn_like(x_img)
+                else:
+                    noise = torch.zeros_like(x_img)
+
+                x_img = (
+                    torch.sqrt(alpha_hat_next) * x0
+                    + torch.sqrt(torch.clamp(1.0 - alpha_hat_next - sigma**2, min=0.0)) * pred
+                    + sigma * noise
+                )
+
+                # Re-project padding each step to prevent drift and boundary leakage.
+                x_img = _apply_padding_projection(x_img, x_mask, pad_value=float(args.pad_value))
+
+        else:
+            # DDPM sampling (full schedule).
+            for i in reversed(range(1, int(args.noise_steps))):
+                t = torch.full((int(args.n),), i, device=device, dtype=torch.long)
+                model_in = torch.cat([x_img, x_mask], dim=1)
+                pred = model(model_in, t, cond)
+                if float(args.cfg_scale) != 1.0:
+                    uncond = model(model_in, t, None)
+                    pred = uncond + float(args.cfg_scale) * (pred - uncond)
+
+                alpha = diffusion.alpha[t][:, None, None, None]
+                alpha_hat = diffusion.alpha_hat[t][:, None, None, None]
+                beta = diffusion.beta[t][:, None, None, None]
+                if bool(args.stochastic) and i > 1:
+                    noise = float(args.eta) * torch.randn_like(x_img)
+                else:
+                    noise = torch.zeros_like(x_img)
+                x_img = (1.0 / torch.sqrt(alpha)) * (x_img - ((1 - alpha) / torch.sqrt(1 - alpha_hat)) * pred) + torch.sqrt(beta) * noise
+
+                # Re-project padding each step to prevent drift and boundary leakage.
+                x_img = _apply_padding_projection(x_img, x_mask, pad_value=float(args.pad_value))
 
     # Convert to numpy in [-1,1]
-    polar_samples = x_img[:, 0].detach().cpu().numpy().astype(np.float32)
-
-    # Prepare cartesian mapping if needed.
-    cartesian_size = None
-    r_use_effective = r_use
-    map_x = map_y = None
-    if bool(args.save_cartesian):
-        if cv2 is None:
-            raise RuntimeError("OpenCV (cv2) is required for cartesian output.")
-        margin = int(args.cartesian_margin)
-
-        if str(args.cartesian_size).lower() == "auto":
-            cartesian_size = int(math.ceil(2.0 * float(r_use)) + 2 * margin)
-        else:
-            try:
-                cartesian_size = int(args.cartesian_size)
-            except ValueError:
-                raise SystemExit("--cartesian-size must be 'auto' or an integer")
-
-        if cartesian_size <= 0:
-            raise SystemExit("--cartesian-size must be > 0")
-
-        r_max_allowed = int(cartesian_size // 2 - margin)
-        if r_max_allowed < 1:
-            raise SystemExit("--cartesian-size too small for the given margin")
-        if r_use > r_max_allowed:
-            warnings.warn(
-                f"cartesian-size={cartesian_size} too small for r_use={r_use}; clamping radius to {r_max_allowed} for cartesian remap.",
-                RuntimeWarning,
-            )
-            r_use_effective = r_max_allowed
-
-        map_x, map_y = _build_inverse_remap_maps(cartesian_size, r_use_effective, theta_bins)
-
-    # Save images.
-    if bool(args.save_polar):
-        if cv2 is None:
-            raise RuntimeError("OpenCV (cv2) is required to save PNG outputs.")
-        for i in range(polar_samples.shape[0]):
-            out = _to_uint8(polar_samples[i])
-            cv2.imwrite(os.path.join(args.outdir, f"polar_{i:03d}.png"), out)
+    cartesian_samples = x_img[:, 0].detach().cpu().numpy().astype(np.float32)
 
     if bool(args.save_cartesian):
         if cv2 is None:
             raise RuntimeError("OpenCV (cv2) is required to save PNG outputs.")
-        assert cartesian_size is not None and map_x is not None and map_y is not None
-        for i in range(polar_samples.shape[0]):
-            cart = _polar_to_cartesian_remap(polar_samples[i], map_x, map_y)
-            out = _to_uint8(cart)
+        for i in range(cartesian_samples.shape[0]):
+            out = _to_uint8(cartesian_samples[i])
             cv2.imwrite(os.path.join(args.outdir, f"cartesian_{i:03d}.png"), out)
 
     # Write metadata
@@ -323,14 +350,17 @@ def main(argv: Optional[List[str]] = None) -> int:
         "n": int(args.n),
         "seed": int(args.seed),
         "cfg_scale": float(args.cfg_scale),
+        "sampler": str(args.sampler),
+        "stochastic": bool(args.stochastic),
+        "eta": float(args.eta),
+        "ddim_steps": int(args.ddim_steps),
+        "ddim_eta": float(args.ddim_eta),
+        "pad_value": float(args.pad_value),
         "noise_steps": int(args.noise_steps),
         "beta_start": float(args.beta_start),
         "beta_end": float(args.beta_end),
-        "polar_shape": [r_model, theta_bins],
-        "cartesian_size": cartesian_size,
-        "cartesian_margin": int(args.cartesian_margin),
-        "r_use": int(r_use),
-        "r_use_effective_cartesian": int(r_use_effective),
+        "cartesian_size": int(size),
+        "r_px": float(r_px),
         "conditions": {
             "cell_format": cell_format,
             "manufacturer": manufacturer,

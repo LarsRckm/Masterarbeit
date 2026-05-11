@@ -7,9 +7,9 @@ Primary:
 
 Run (PowerShell, with venv):
   . "C:/Users/larsr/Documents/PythonVenv/Scripts/Activate.ps1"; \
-  python -m model.CT_scan_model.scripts.build_splits \
-    --geometry model/CT_scan_model/cell_geometry.json \
-    --out      model/CT_scan_model/splits.json
+  python -m CT_scan_model.scripts.build_splits \
+    --geometry CT_scan_model/cell_geometry.json \
+    --out      CT_scan_model/splits.json
 """
 
 from __future__ import annotations
@@ -70,12 +70,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     p = argparse.ArgumentParser(description="Build train/val/test splits (cell-folder level) for CT training.")
     p.add_argument(
         "--geometry",
-        default=os.path.join("model", "CT_scan_model", "cell_geometry.json"),
+        default=os.path.join("CT_scan_model", "cell_geometry.json"),
         help="Input cell_geometry.json path",
     )
     p.add_argument(
         "--out",
-        default=os.path.join("model", "CT_scan_model", "splits.json"),
+        default=os.path.join("CT_scan_model", "splits.json"),
         help="Output splits JSON path",
     )
     p.add_argument("--seed", type=int, default=42)

@@ -1,14 +1,14 @@
-"""Training script for polar CT DDPM with train/val/test cell splits.
+"""Training script for cartesian CT DDPM with train/val/test cell splits.
 
-This script trains UNet_conditional_polar on polar tensors [image, mask].
-It uses a masked MSE loss so padded pixels do not dominate training.
+This script trains UNet_conditional_cartesian on cartesian tensors [image, mask].
+It uses a masked MSE loss so pixels outside the circular mask do not dominate training.
 
 Run (PowerShell, with venv):
   . "C:/Users/larsr/Documents/PythonVenv/Scripts/Activate.ps1"; \
-  python -m model.CT_scan_model.scripts.train_ct_ddpm \
-    --index    model/CT_scan_model/cell_index.json \
-    --geometry model/CT_scan_model/cell_geometry.json \
-    --splits   model/CT_scan_model/splits.json
+  python -m CT_scan_model.scripts.train_ct_ddpm \
+    --index    CT_scan_model/cell_index.json \
+    --geometry CT_scan_model/cell_geometry.json \
+    --splits   CT_scan_model/splits.json
 """
 
 from __future__ import annotations
@@ -38,13 +38,13 @@ except Exception:  # pragma: no cover
 
 import math
 
-from ..dataset_ct_polar import (
+from ..dataset_ct_cartesian import (
     BatteryCTPerCellDataset,
     BatteryCTSelectedSamplesDataset,
     BatteryCTUniformCellsMaxPicturesDataset,
 )
-from ..diffusion_polar import Diffusion
-from ..modules_polar_ct import UNet_conditional_polar
+from ..diffusion_cartesian import Diffusion
+from ..modules_cartesian_ct import UNet_conditional_cartesian
 
 
 class EMA:
@@ -64,7 +64,7 @@ class EMA:
 
 
 def masked_mse(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-    # mask: [B, R, Theta] or [B,1,R,Theta]
+    # mask: [B, H, W] or [B, 1, H, W]
     if mask.dim() == 3:
         mask = mask[:, None, :, :]
     mask = mask.to(dtype=pred.dtype)
@@ -90,7 +90,7 @@ def sample_with_mask(
 ) -> torch.Tensor:
     """DDPM sampling with a fixed padding mask.
 
-    Returns image channel only: [n, 1, R, Theta]
+    Returns image channel only: [n, 1, H, W]
     """
     model.eval()
     r = int(mask.shape[-2])
@@ -146,10 +146,10 @@ def _append_csv_row(path: str, header: list[str], row: list) -> None:
 
 
 def main(argv: Optional[list[str]] = None) -> int:
-    p = argparse.ArgumentParser(description="Train polar CT DDPM (single GPU).")
-    p.add_argument("--index", default=os.path.join("model", "CT_scan_model", "cell_index.json"))
-    p.add_argument("--geometry", default=os.path.join("model", "CT_scan_model", "cell_geometry.json"))
-    p.add_argument("--splits", default=os.path.join("model", "CT_scan_model", "splits.json"))
+    p = argparse.ArgumentParser(description="Train cartesian CT DDPM (single GPU).")
+    p.add_argument("--index", default=os.path.join("CT_scan_model", "cell_index.json"))
+    p.add_argument("--geometry", default=os.path.join("CT_scan_model", "cell_geometry.json"))
+    p.add_argument("--splits", default=os.path.join("CT_scan_model", "splits.json"))
 
     p.add_argument(
         "--slices-per-cell",
@@ -191,7 +191,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     p.add_argument("--p-uncond", type=float, default=0.1, help="Probability to drop conditioning (CFG training)")
 
     p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--run-dir", default=None, help="Output directory (default: model/CT_scan_model/runs/<timestamp>)")
+    p.add_argument("--run-dir", default=None, help="Output directory (default: runs/ct_scan_model/<timestamp>)")
     p.add_argument("--save-every", type=int, default=1, help="Save checkpoint every N epochs")
     p.add_argument(
         "--tqdm",
@@ -209,7 +209,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     p.add_argument(
         "--sample-n",
         type=int,
-        default=2,
+        default=1,
         help="How many samples to generate per validation condition.",
     )
     p.add_argument(
@@ -351,8 +351,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         pin_memory=torch.cuda.is_available(),
     )
 
-    model = UNet_conditional_polar().to(device)
-    ema_model = UNet_conditional_polar().to(device)
+    model = UNet_conditional_cartesian().to(device)
+    ema_model = UNet_conditional_cartesian().to(device)
     ema_model.load_state_dict(model.state_dict())
     ema_model.eval()
     for p_ in ema_model.parameters():
@@ -574,7 +574,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                 f"Epoch {epoch:04d} | train_loss={train_loss:.6f} | val_loss({'ema' if not bool(args.no_ema_val) else 'raw'})={val_loss:.6f}"
             )
 
-            # Save validation pictures (polar images) for the selected validation samples.
+            # Save validation pictures (cartesian images) for the selected validation samples.
             # We save the un-noised input image channel for quick visual sanity checks.
             if cv2 is not None:
                 try:

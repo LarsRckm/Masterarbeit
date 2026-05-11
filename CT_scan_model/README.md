@@ -1,6 +1,6 @@
-# CT_scan_model (Polar CT DDPM)
+# CT_scan_model (Cartesian CT DDPM)
 
-This folder contains the **polar CT diffusion model** (UNet + DDPM utilities) and
+This folder contains the **cartesian CT diffusion model** (UNet + DDPM utilities) and
 the training pipeline.
 
 ## Quickstart
@@ -14,28 +14,28 @@ Activate your virtual environment first:
 Then run the pipeline steps in order:
 
 ```powershell
-python -m model.CT_scan_model.scripts.build_cell_index \
-  --out model/CT_scan_model/cell_index.json
+python -m CT_scan_model.scripts.build_cell_index \
+  --out CT_scan_model/cell_index.json
 
-python -m model.CT_scan_model.scripts.precompute_geometry \
-  --index model/CT_scan_model/cell_index.json \
-  --out   model/CT_scan_model/cell_geometry.json
+python -m CT_scan_model.scripts.precompute_geometry \
+  --index CT_scan_model/cell_index.json \
+  --out   CT_scan_model/cell_geometry.json
 
-python -m model.CT_scan_model.scripts.build_splits \
-  --geometry model/CT_scan_model/cell_geometry.json \
-  --out      model/CT_scan_model/splits.json
+python -m CT_scan_model.scripts.build_splits \
+  --geometry CT_scan_model/cell_geometry.json \
+  --out      CT_scan_model/splits.json
 
-python -m model.CT_scan_model.scripts.train_ct_ddpm \
-  --index    model/CT_scan_model/cell_index.json \
-  --geometry model/CT_scan_model/cell_geometry.json \
-  --splits   model/CT_scan_model/splits.json
+python -m CT_scan_model.scripts.train_ct_ddpm \
+  --index    CT_scan_model/cell_index.json \
+  --geometry CT_scan_model/cell_geometry.json \
+  --splits   CT_scan_model/splits.json
 
 ## Sampling (generate synthetic images)
 
-Generate synthetic **polar** images (and optional centered **cartesian** images) from a trained checkpoint:
+Generate synthetic **cartesian** images from a trained checkpoint:
 
 ```powershell
-python -m model.CT_scan_model.scripts.sample_ct_ddpm \
+python -m CT_scan_model.scripts.sample_ct_ddpm \
   --ckpt runs/ct_scan_model/<timestamp>/checkpoint_best.pt \
   --outdir runs/ct_scan_model/<timestamp>/samples \
   --n 8 \
@@ -93,33 +93,32 @@ Only slices with `0.1 <= rel_depth <= 0.9` are included.
   - additionally stratify by `(manufacturer, chemistry)` if feasible; otherwise
     the script falls back automatically.
 
-Splits are stored in `model/CT_scan_model/splits.json`.
+Splits are stored in `CT_scan_model/splits.json`.
 
-## Polar representation + padding mask
+## Cartesian representation + circular mask
 
-The model consumes fixed-size polar tensors:
+The model consumes fixed-size cartesian tensors:
 
-- `POLAR_THETA_BINS = 1024`
-- `POLAR_R_MODEL = 704`
+- `CARTESIAN_SIZE = 1024`
 
 Each training input has 2 channels:
 
 1. image (normalized to `[-1, 1]`)
-2. mask (1 = valid radius, 0 = padded radius)
+2. mask (1 = inside circle, 0 = outside circle)
 
-The training loss is a **masked MSE** so padded pixels do not dominate gradients.
+The training loss is a **masked MSE** so pixels outside the mask do not dominate gradients.
 
 ## Code layout
 
 ### Reusable modules
 
-- `modules_polar_ct.py` – UNet for polar CT with conditioning
-- `diffusion_polar.py` – mask-aware DDPM forward/reverse process
-- `dataset_ct_polar.py` – dataset: png -> polar tensor + mask + conditioning
+- `modules_cartesian_ct.py` – UNet for cartesian CT with conditioning
+- `diffusion_cartesian.py` – mask-aware DDPM forward/reverse process
+- `dataset_ct_cartesian.py` – dataset: png -> resized cartesian tensor + circle mask + conditioning
 
 ### CLI entrypoints
 
-Entry points live in `model/CT_scan_model/scripts/`:
+Entry points live in `CT_scan_model/scripts/`:
 
 - `build_cell_index.py`
 - `precompute_geometry.py`
@@ -130,7 +129,7 @@ Wrappers exist in the package root for backwards compatibility.
 
 ### Legacy
 
-Legacy scripts are kept under `model/CT_scan_model/legacy/`.
+Legacy scripts are kept under `CT_scan_model/legacy/`.
 
 ## Notes
 

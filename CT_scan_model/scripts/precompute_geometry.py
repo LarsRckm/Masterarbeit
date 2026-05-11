@@ -5,13 +5,13 @@ For each cell_id in the cell_index.json, this script:
 - estimates (cx, cy, r_valid) via Otsu + morphology + enclosing circle
 - stores metadata (manufacturer, chemistry, voxel size)
 
-Output JSON is consumed by dataset_ct_polar.py and build_splits.py.
+Output JSON is consumed by the dataset and build_splits.py.
 
 Run (PowerShell, with venv):
   . "C:/Users/larsr/Documents/PythonVenv/Scripts/Activate.ps1"; \
-  python -m model.CT_scan_model.scripts.precompute_geometry \
-    --index model/CT_scan_model/cell_index.json \
-    --out   model/CT_scan_model/cell_geometry.json
+  python -m CT_scan_model.scripts.precompute_geometry \
+    --index CT_scan_model/cell_index.json \
+    --out   CT_scan_model/cell_geometry.json
 """
 
 from __future__ import annotations
@@ -81,12 +81,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     p = argparse.ArgumentParser(description="Precompute per-cell CT geometry (cx,cy,r_valid).")
     p.add_argument(
         "--index",
-        default=os.path.join("model", "CT_scan_model", "cell_index.json"),
+        default=os.path.join("CT_scan_model", "cell_index.json"),
         help="Input cell_index.json path",
     )
     p.add_argument(
         "--out",
-        default=os.path.join("model", "CT_scan_model", "cell_geometry.json"),
+        default=os.path.join("CT_scan_model", "cell_geometry.json"),
         help="Output geometry JSON path",
     )
     p.add_argument("--target-rel-depth", type=float, default=0.5)

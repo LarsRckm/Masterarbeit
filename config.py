@@ -32,6 +32,14 @@ POLAR_R_MODEL = 704
 POLAR_R_VALID_REF_MAX = 662
 
 # -----------------------------------------------------------------------------
+# Cartesian representation (model input)
+# -----------------------------------------------------------------------------
+
+# Fixed square model size used after resizing.
+# Needs to be divisible by 2**UNET_NUM_DOWNS.
+CARTESIAN_SIZE = 1024
+
+# -----------------------------------------------------------------------------
 # UNet / DDPM model parameters (architecture only)
 # -----------------------------------------------------------------------------
 
