@@ -43,7 +43,6 @@ python -m CT_scan_model.scripts.sample_ct_ddpm \
   --manufacturer EVE \
   --chemistry Lithium-ion \
   --slice-depth-relative 0.50 \
-  --voxel-size-um 14.4 \
   --r-valid-rel 0.94 \
   --cfg-scale 1.0
 ```

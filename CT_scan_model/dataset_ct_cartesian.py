@@ -4,7 +4,7 @@ Returns:
   x:    float tensor [2, CARTESIAN_SIZE, CARTESIAN_SIZE] (image + mask)
   cond: tuple(cat, cont) where
         cat : long tensor  [3] with (cell_format_id, manufacturer_id, chemistry_id)
-        cont: float tensor [3] with (slice_depth_relative, voxel_size_um, r_valid_rel)
+        cont: float tensor [2] with (slice_depth_relative, r_valid_rel)
 
 The mask is 1 inside the estimated cell circle (r_valid) and 0 outside.
 Images are resized (no crop) to a fixed square CARTESIAN_SIZE.
@@ -62,6 +62,80 @@ def _circle_mask(size: int, cx: float, cy: float, r: float) -> np.ndarray:
     yy, xx = np.ogrid[:size, :size]
     dist2 = (xx.astype(np.float32) - float(cx)) ** 2 + (yy.astype(np.float32) - float(cy)) ** 2
     return (dist2 <= float(r) ** 2).astype(np.float32)
+
+
+def _estimate_circle_from_otsu_outer(gray: np.ndarray, morph_kernel_size: int = 25) -> tuple[float, float, float]:
+    """Estimate outer cell circle (cx, cy, r) from the Otsu threshold.
+
+    Implementation is aligned with:
+      Data_Preprocessing/Maskierung/Hintergrund_Vordergrund/make_fg_bg_mask.py
+
+    Steps:
+      1) blur -> Otsu threshold
+      2) (optional) morphology close+open (cleanup only; circle fit uses bw_otsu)
+      3) outside->inside edge tracing on bw_otsu, then minEnclosingCircle
+      4) fallback: largest external contour on bw_otsu
+    """
+    h, w = gray.shape[:2]
+    cx0, cy0 = (w - 1) / 2.0, (h - 1) / 2.0
+    r0 = min(h, w) / 2.0 - 2.0
+
+    if cv2 is None:
+        return float(cx0), float(cy0), float(max(1.0, r0))
+
+    try:
+        blurred = cv2.GaussianBlur(gray, (9, 9), 0)
+        _, bw_otsu = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+        k = int(max(3, morph_kernel_size))
+        if k % 2 == 0:
+            k += 1
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+        # Morphology is kept as an optional cleanup step (not used for circle fitting).
+        _ = cv2.morphologyEx(bw_otsu, cv2.MORPH_CLOSE, kernel)
+        _ = cv2.morphologyEx(_, cv2.MORPH_OPEN, kernel)
+
+        # 1) Outside->inside edge tracing on bw_otsu.
+        r_max = int(
+            max(
+                1.0,
+                min(
+                    cx0,
+                    cy0,
+                    (w - 1) - cx0,
+                    (h - 1) - cy0,
+                ),
+            )
+        )
+        angles = np.linspace(0.0, 2.0 * np.pi, 720, endpoint=False)
+        pts: list[tuple[int, int]] = []
+        for a in angles:
+            ca = float(np.cos(a))
+            sa = float(np.sin(a))
+            for r in range(r_max, 0, -1):
+                x = int(round(cx0 + float(r) * ca))
+                y = int(round(cy0 + float(r) * sa))
+                if 0 <= x < w and 0 <= y < h and int(bw_otsu[y, x]) > 0:
+                    pts.append((x, y))
+                    break
+
+        if len(pts) >= 20:
+            edge_points = np.asarray(pts, dtype=np.int32).reshape(-1, 1, 2)
+            (cx, cy), r = cv2.minEnclosingCircle(edge_points)
+            r = float(np.clip(float(r), 1.0, min(h, w) / 2.0))
+            return float(cx), float(cy), float(r)
+
+        # 2) Fallback: largest contour on bw_otsu.
+        contours, _ = cv2.findContours(bw_otsu, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if contours:
+            largest = max(contours, key=cv2.contourArea)
+            (cx, cy), r = cv2.minEnclosingCircle(largest)
+            r = float(np.clip(float(r), 1.0, min(h, w) / 2.0))
+            return float(cx), float(cy), float(r)
+
+        return float(cx0), float(cy0), float(max(1.0, r0))
+    except Exception:
+        return float(cx0), float(cy0), float(max(1.0, r0))
 
 
 @dataclass(frozen=True)
@@ -131,10 +205,9 @@ class BatteryCTCartesianDataset(Dataset):
         h, w = gray.shape[:2]
         gray_rs = _resize_gray(gray, size=self.size)
 
-        cx = float(g["cx"])
-        cy = float(g["cy"])
-        r_valid = float(g["r_valid"])
-        cx_s, cy_s, r_s = _scale_geometry(cx, cy, r_valid, w=w, h=h, size=self.size)
+        # Build the mask per-image (Otsu-based outer circle), analogous to make_fg_bg_mask.py.
+        cx0, cy0, r0 = _estimate_circle_from_otsu_outer(gray, morph_kernel_size=25)
+        cx_s, cy_s, r_s = _scale_geometry(cx0, cy0, r0, w=w, h=h, size=self.size)
 
         # Clamp radius into a sane range.
         r_s = float(np.clip(r_s, 1.0, float(self.size) / 2.0))
@@ -150,9 +223,6 @@ class BatteryCTCartesianDataset(Dataset):
         cell_format = str(g.get("cell_format", "Unknown"))
         manufacturer = str(g.get("manufacturer", "Unknown"))
         chemistry = str(g.get("chemistry", "Unknown"))
-        voxel_size_um = g.get("voxel_size_um", 0.0)
-        voxel_size_um = 0.0 if voxel_size_um is None else float(voxel_size_um)
-
         cat = torch.tensor(
             [
                 _vocab_index(project_config.CELL_FORMAT_VOCAB, cell_format),
@@ -163,17 +233,9 @@ class BatteryCTCartesianDataset(Dataset):
         )
 
         # r_valid_rel relative to the maximal circle radius in a square image.
-        r_valid_rel = float(r_s) / (float(self.size) / 2.0)
-        r_valid_rel = float(np.clip(r_valid_rel, 0.0, 1.0))
+        r_valid_rel = float(np.clip(float(r_s) / (float(self.size) / 2.0), 0.0, 1.0))
 
-        cont = torch.tensor(
-            [
-                float(s.slice_depth_relative),
-                float(voxel_size_um),
-                float(r_valid_rel),
-            ],
-            dtype=torch.float32,
-        )
+        cont = torch.tensor([float(s.slice_depth_relative), float(r_valid_rel)], dtype=torch.float32)
         return x, (cat, cont), torch.from_numpy(mask)
 
 
@@ -267,10 +329,8 @@ class BatteryCTPerCellDataset(Dataset):
         h, w = gray.shape[:2]
         gray_rs = _resize_gray(gray, size=self.size)
 
-        cx = float(g["cx"])
-        cy = float(g["cy"])
-        r_valid = float(g["r_valid"])
-        cx_s, cy_s, r_s = _scale_geometry(cx, cy, r_valid, w=w, h=h, size=self.size)
+        cx0, cy0, r0 = _estimate_circle_from_otsu_outer(gray, morph_kernel_size=25)
+        cx_s, cy_s, r_s = _scale_geometry(cx0, cy0, r0, w=w, h=h, size=self.size)
         r_s = float(np.clip(r_s, 1.0, float(self.size) / 2.0))
 
         img = (gray_rs.astype(np.float32) / 255.0) * 2.0 - 1.0
@@ -280,9 +340,6 @@ class BatteryCTPerCellDataset(Dataset):
         cell_format = str(g.get("cell_format", "Unknown"))
         manufacturer = str(g.get("manufacturer", "Unknown"))
         chemistry = str(g.get("chemistry", "Unknown"))
-        voxel_size_um = g.get("voxel_size_um", 0.0)
-        voxel_size_um = 0.0 if voxel_size_um is None else float(voxel_size_um)
-
         cat = torch.tensor(
             [
                 _vocab_index(project_config.CELL_FORMAT_VOCAB, cell_format),
@@ -292,10 +349,7 @@ class BatteryCTPerCellDataset(Dataset):
             dtype=torch.long,
         )
         r_valid_rel = float(np.clip(float(r_s) / (float(self.size) / 2.0), 0.0, 1.0))
-        cont = torch.tensor(
-            [float(slice_depth_relative), float(voxel_size_um), float(r_valid_rel)],
-            dtype=torch.float32,
-        )
+        cont = torch.tensor([float(slice_depth_relative), float(r_valid_rel)], dtype=torch.float32)
         return x, (cat, cont), torch.from_numpy(mask)
 
 
@@ -350,9 +404,6 @@ class BatteryCTSelectedSamplesDataset(Dataset):
         cell_format = str(g.get("cell_format", "Unknown"))
         manufacturer = str(g.get("manufacturer", "Unknown"))
         chemistry = str(g.get("chemistry", "Unknown"))
-        voxel_size_um = g.get("voxel_size_um", 0.0)
-        voxel_size_um = 0.0 if voxel_size_um is None else float(voxel_size_um)
-
         cat = torch.tensor(
             [
                 _vocab_index(project_config.CELL_FORMAT_VOCAB, cell_format),
@@ -362,10 +413,7 @@ class BatteryCTSelectedSamplesDataset(Dataset):
             dtype=torch.long,
         )
         r_valid_rel = float(np.clip(float(r_s) / (float(self.size) / 2.0), 0.0, 1.0))
-        cont = torch.tensor(
-            [float(slice_depth_relative), float(voxel_size_um), float(r_valid_rel)],
-            dtype=torch.float32,
-        )
+        cont = torch.tensor([float(slice_depth_relative), float(r_valid_rel)], dtype=torch.float32)
         return x, (cat, cont), torch.from_numpy(mask)
 
 
@@ -472,9 +520,6 @@ class BatteryCTUniformCellsMaxPicturesDataset(Dataset):
         cell_format = str(g.get("cell_format", "Unknown"))
         manufacturer = str(g.get("manufacturer", "Unknown"))
         chemistry = str(g.get("chemistry", "Unknown"))
-        voxel_size_um = g.get("voxel_size_um", 0.0)
-        voxel_size_um = 0.0 if voxel_size_um is None else float(voxel_size_um)
-
         cat = torch.tensor(
             [
                 _vocab_index(project_config.CELL_FORMAT_VOCAB, cell_format),
@@ -484,8 +529,5 @@ class BatteryCTUniformCellsMaxPicturesDataset(Dataset):
             dtype=torch.long,
         )
         r_valid_rel = float(np.clip(float(r_s) / (float(self.size) / 2.0), 0.0, 1.0))
-        cont = torch.tensor(
-            [float(slice_depth_relative), float(voxel_size_um), float(r_valid_rel)],
-            dtype=torch.float32,
-        )
+        cont = torch.tensor([float(slice_depth_relative), float(r_valid_rel)], dtype=torch.float32)
         return x, (cat, cont), torch.from_numpy(mask)

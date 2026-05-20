@@ -5,7 +5,7 @@ Expected input:
   t:    int/long tensor [B] (diffusion timestep)
   cond: either None (unconditional) or a tuple (cat, cont)
         cat : long tensor  [B, 3] with (cell_format_id, manufacturer_id, chemistry_id)
-        cont: float tensor [B, 3] with (slice_depth_relative, voxel_size_um, r_valid_rel)
+        cont: float tensor [B, 2] with (slice_depth_relative, r_valid_rel)
 """
 
 from __future__ import annotations
@@ -23,15 +23,25 @@ except ImportError:  # pragma: no cover
 
 
 class DoubleConv(nn.Module):
-    def __init__(self, in_channels: int, out_channels: int, mid_channels: Optional[int] = None, residual: bool = False):
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        mid_channels: Optional[int] = None,
+        residual: bool = False,
+        dilation: int = 1,
+    ):
         super().__init__()
         self.residual = residual
         if mid_channels is None:
             mid_channels = out_channels
 
-        self.conv1 = nn.Conv2d(in_channels, mid_channels, kernel_size=3, padding=1, bias=False)
+        d = int(max(1, dilation))
+        pad = d
+
+        self.conv1 = nn.Conv2d(in_channels, mid_channels, kernel_size=3, padding=pad, dilation=d, bias=False)
         self.gn1 = nn.GroupNorm(1, mid_channels)
-        self.conv2 = nn.Conv2d(mid_channels, out_channels, kernel_size=3, padding=1, bias=False)
+        self.conv2 = nn.Conv2d(mid_channels, out_channels, kernel_size=3, padding=pad, dilation=d, bias=False)
         self.gn2 = nn.GroupNorm(1, out_channels)
         self.act = nn.GELU()
 
@@ -182,15 +192,17 @@ class UNet_conditional_cartesian(nn.Module):
         c_out: int = project_config.UNET_OUT_CHANNELS,
         base_channels: int = project_config.UNET_BASE_CHANNELS,
         time_dim: int = project_config.TIME_EMB_DIM,
-        num_downs: int = project_config.UNET_NUM_DOWNS,
+        num_downs: int = project_config.UNET_NUM_DOWNS_CARTESIAN,
         cond_cont_dim: int = project_config.COND_CONT_DIM,
     ):
         super().__init__()
-        if num_downs != 5:
-            raise ValueError("UNet_conditional_cartesian currently supports num_downs=5.")
+
+        if num_downs not in {2, 3, 4, 5}:
+            raise ValueError("UNet_conditional_cartesian currently supports num_downs in {2, 3, 4, 5}.")
 
         self.time_dim = time_dim
         self.cond_channels = 1
+        self.num_downs = int(num_downs)
 
         self.inc = DoubleConv(c_in, base_channels)
 
@@ -202,23 +214,43 @@ class UNet_conditional_cartesian(nn.Module):
 
         self.down1 = Down(base_channels, ch1, emb_dim=time_dim, cond_channels=self.cond_channels)
         self.down2 = Down(ch1, ch2, emb_dim=time_dim, cond_channels=self.cond_channels)
-        self.down3 = Down(ch2, ch3, emb_dim=time_dim, cond_channels=self.cond_channels)
-        self.down4 = Down(ch3, ch4, emb_dim=time_dim, cond_channels=self.cond_channels)
-        self.down5 = Down(ch4, ch5, emb_dim=time_dim, cond_channels=self.cond_channels)
+        if self.num_downs >= 3:
+            self.down3 = Down(ch2, ch3, emb_dim=time_dim, cond_channels=self.cond_channels)
+        if self.num_downs >= 4:
+            self.down4 = Down(ch3, ch4, emb_dim=time_dim, cond_channels=self.cond_channels)
+        if self.num_downs >= 5:
+            self.down5 = Down(ch4, ch5, emb_dim=time_dim, cond_channels=self.cond_channels)
 
         self.attn_enabled = project_config.ATTN_ENABLED
         max_tokens = project_config.ATTN_MAX_TOKENS
         heads = project_config.ATTN_HEADS
-        self.sa4 = SelfAttentionDynamic(ch4, num_heads=heads, max_tokens=max_tokens)
-        self.sa5 = SelfAttentionDynamic(ch5, num_heads=heads, max_tokens=max_tokens)
+        if self.num_downs >= 4:
+            self.sa4 = SelfAttentionDynamic(ch4, num_heads=heads, max_tokens=max_tokens)
+        if self.num_downs >= 5:
+            self.sa5 = SelfAttentionDynamic(ch5, num_heads=heads, max_tokens=max_tokens)
 
-        self.bot1 = DoubleConv(ch5, ch5)
-        self.bot2 = DoubleConv(ch5, ch5)
-        self.bot3 = DoubleConv(ch5, ch5)
+        if self.num_downs == 2:
+            # Bottleneck at 256x256 (after down2).
+            bot_ch = ch2
+        elif self.num_downs == 3:
+            # Bottleneck at 128x128 (after down3).
+            bot_ch = ch3
+        elif self.num_downs == 4:
+            # Bottleneck at 64x64 (after down4).
+            bot_ch = ch4
+        else:
+            # Bottleneck at 32x32 (after down5).
+            bot_ch = ch5
+        self.bot1 = DoubleConv(bot_ch, bot_ch, dilation=1)
+        self.bot2 = DoubleConv(bot_ch, bot_ch, dilation=2)
+        self.bot3 = DoubleConv(bot_ch, bot_ch, dilation=4)
 
-        self.up5 = Up(ch5 + ch4, ch4, emb_dim=time_dim, cond_channels=self.cond_channels)
-        self.up4 = Up(ch4 + ch3, ch3, emb_dim=time_dim, cond_channels=self.cond_channels)
-        self.up3 = Up(ch3 + ch2, ch2, emb_dim=time_dim, cond_channels=self.cond_channels)
+        if self.num_downs >= 5:
+            self.up5 = Up(ch5 + ch4, ch4, emb_dim=time_dim, cond_channels=self.cond_channels)
+        if self.num_downs >= 4:
+            self.up4 = Up(ch4 + ch3, ch3, emb_dim=time_dim, cond_channels=self.cond_channels)
+        if self.num_downs >= 3:
+            self.up3 = Up(ch3 + ch2, ch2, emb_dim=time_dim, cond_channels=self.cond_channels)
         self.up2 = Up(ch2 + ch1, ch1, emb_dim=time_dim, cond_channels=self.cond_channels)
         self.up1 = Up(ch1 + base_channels, base_channels, emb_dim=time_dim, cond_channels=self.cond_channels)
 
@@ -252,21 +284,34 @@ class UNet_conditional_cartesian(nn.Module):
         x0 = self.inc(x)
         x1 = self.down1(x0, t_emb, c_emb)
         x2 = self.down2(x1, t_emb, c_emb)
-        x3 = self.down3(x2, t_emb, c_emb)
-        x4 = self.down4(x3, t_emb, c_emb)
-        if self.attn_enabled:
-            x4 = self.sa4(x4)
-        x5 = self.down5(x4, t_emb, c_emb)
-        if self.attn_enabled:
-            x5 = self.sa5(x5)
+        if self.num_downs >= 3:
+            x3 = self.down3(x2, t_emb, c_emb)
+        if self.num_downs >= 4:
+            x4 = self.down4(x3, t_emb, c_emb)
+            if self.attn_enabled:
+                x4 = self.sa4(x4)
+        if self.num_downs >= 5:
+            x5 = self.down5(x4, t_emb, c_emb)
+            if self.attn_enabled:
+                x5 = self.sa5(x5)
 
-        x5 = self.bot1(x5)
-        x5 = self.bot2(x5)
-        x5 = self.bot3(x5)
+        if self.num_downs == 2:
+            x = self.bot1(x2)
+        elif self.num_downs == 3:
+            x = self.bot1(x3)
+        elif self.num_downs == 4:
+            x = self.bot1(x4)
+        else:
+            x = self.bot1(x5)
+        x = self.bot2(x)
+        x = self.bot3(x)
 
-        x = self.up5(x5, x4, t_emb, c_emb)
-        x = self.up4(x, x3, t_emb, c_emb)
-        x = self.up3(x, x2, t_emb, c_emb)
+        if self.num_downs >= 5:
+            x = self.up5(x, x4, t_emb, c_emb)
+        if self.num_downs >= 4:
+            x = self.up4(x, x3, t_emb, c_emb)
+        if self.num_downs >= 3:
+            x = self.up3(x, x2, t_emb, c_emb)
         x = self.up2(x, x1, t_emb, c_emb)
         x = self.up1(x, x0, t_emb, c_emb)
         return self.outc(x)

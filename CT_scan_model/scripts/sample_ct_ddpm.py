@@ -16,7 +16,6 @@ Run (PowerShell, with venv):
     --manufacturer EVE \
     --chemistry Lithium-ion \
     --slice-depth-relative 0.50 \
-    --voxel-size-um 14.4 \
     --r-valid-rel 0.94 \
     --cfg-scale 1.0
 """
@@ -140,7 +139,6 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--manufacturer", required=True)
     p.add_argument("--chemistry", required=True)
     p.add_argument("--slice-depth-relative", type=float, required=True)
-    p.add_argument("--voxel-size-um", type=float, required=True)
     p.add_argument("--r-valid-rel", type=float, required=True)
 
     # Sampling
@@ -202,8 +200,6 @@ def main(argv: Optional[List[str]] = None) -> int:
         raise SystemExit("--slice-depth-relative must be in [0,1]")
     if not (0.0 < float(args.r_valid_rel) <= 1.0):
         raise SystemExit("--r-valid-rel must be in (0,1]")
-    if float(args.voxel_size_um) <= 0:
-        raise SystemExit("--voxel-size-um must be > 0")
     # (no cartesian size/margin args in this approach)
     if float(args.eta) < 0:
         raise SystemExit("--eta must be >= 0")
@@ -232,7 +228,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     ]
     cat = torch.tensor(cat_ids, dtype=torch.long, device=device)[None, :].repeat(int(args.n), 1)
     cont = torch.tensor(
-        [float(args.slice_depth_relative), float(args.voxel_size_um), float(args.r_valid_rel)],
+        [float(args.slice_depth_relative), float(args.r_valid_rel)],
         dtype=torch.float32,
         device=device,
     )[None, :].repeat(int(args.n), 1)
@@ -366,11 +362,10 @@ def main(argv: Optional[List[str]] = None) -> int:
             "manufacturer": manufacturer,
             "chemistry": chemistry,
             "slice_depth_relative": float(args.slice_depth_relative),
-            "voxel_size_um": float(args.voxel_size_um),
             "r_valid_rel": float(args.r_valid_rel),
         },
         "cat_ids": cat_ids,
-        "cont": [float(args.slice_depth_relative), float(args.voxel_size_um), float(args.r_valid_rel)],
+        "cont": [float(args.slice_depth_relative), float(args.r_valid_rel)],
     }
     with open(meta_path, "w", encoding="utf-8") as f:
         json.dump(meta, f, indent=2)

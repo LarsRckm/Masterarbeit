@@ -18,38 +18,29 @@ import os
 BASE_PATH = "/data/Data/projects/GLIMPSE/cylindrical"
 
 # -----------------------------------------------------------------------------
-# Polar representation (model input)
-# -----------------------------------------------------------------------------
-
-# Fixed angular resolution (theta bins). Theta is treated as periodic.
-POLAR_THETA_BINS = 1024
-
-# Fixed radial model size (r bins) used after padding.
-# Needs to be divisible by 2**UNET_NUM_DOWNS.
-POLAR_R_MODEL = 704
-
-# Optional reference: typical max usable radius in pixels (for checks/plots)
-POLAR_R_VALID_REF_MAX = 662
-
-# -----------------------------------------------------------------------------
 # Cartesian representation (model input)
 # -----------------------------------------------------------------------------
 
 # Fixed square model size used after resizing.
-# Needs to be divisible by 2**UNET_NUM_DOWNS.
+# Needs to be divisible by 2**UNET_NUM_DOWNS_CARTESIAN.
 CARTESIAN_SIZE = 1024
 
 # -----------------------------------------------------------------------------
 # UNet / DDPM model parameters (architecture only)
 # -----------------------------------------------------------------------------
 
-UNET_NUM_DOWNS = 5
+# Cartesian UNet downs.
+# For CARTESIAN_SIZE=1024:
+#   - UNET_NUM_DOWNS_CARTESIAN=2 -> bottleneck 256x256
+#   - UNET_NUM_DOWNS_CARTESIAN=3 -> bottleneck 128x128
+#   - UNET_NUM_DOWNS_CARTESIAN=5 -> bottleneck 32x32
+UNET_NUM_DOWNS_CARTESIAN = 5
 
 # Input is (image, mask)
 UNET_IN_CHANNELS = 2
 UNET_OUT_CHANNELS = 1
 
-UNET_BASE_CHANNELS = 16
+UNET_BASE_CHANNELS = 64
 
 TIME_EMB_DIM = 512
 
@@ -71,8 +62,9 @@ CELL_FORMAT_VOCAB_SIZE = len(CELL_FORMAT_VOCAB)
 MANUFACTURER_VOCAB_SIZE = len(MANUFACTURER_VOCAB)
 CHEMISTRY_VOCAB_SIZE = len(CHEMISTRY_VOCAB)
 
-# Continuous condition values expected (slice depth rel, voxel size, r_valid_rel)
-COND_CONT_DIM = 3
+# Continuous condition values used by the cartesian pipeline:
+#   (slice_depth_relative, r_valid_rel)
+COND_CONT_DIM = 2
 
 # Embedding dims for categorical features.
 COND_CAT_EMB_DIM = 64
