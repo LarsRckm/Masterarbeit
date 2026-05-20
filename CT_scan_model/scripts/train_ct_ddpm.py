@@ -196,6 +196,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     p.add_argument(
         "--tqdm",
         action="store_true",
+        default=True,
         help="Show a per-epoch tqdm progress bar (useful for debugging long epochs).",
     )
 
@@ -203,7 +204,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     p.add_argument(
         "--sample-every",
         type=int,
-        default=0,
+        default=20,
         help="If >0, generate qualitative samples every N epochs.",
     )
     p.add_argument(
@@ -218,7 +219,24 @@ def main(argv: Optional[list[str]] = None) -> int:
         default=1.0,
         help="CFG scale used for qualitative sampling.",
     )
+
+    # ClearML logging (enabled by default)
+    p.add_argument("--no-clearml", action="store_true", help="Disable ClearML logging")
     args = p.parse_args(argv)
+
+    clearml_task = None
+    clearml_logger = None
+    if not bool(args.no_clearml):
+        from clearml import Task  # type: ignore
+
+        clearml_task = Task.init(
+            project_name="ISEAnet",  # umbrella, freeform
+            task_name="tte-lre-master-ct-scan",  # this run
+            task_type=Task.TaskTypes.training,
+        )
+        clearml_task.execute_remotely(queue_name="bumblebee-a100-shared", clone_task_id=True)
+        clearml_task.connect(vars(args))
+        clearml_logger = clearml_task.get_logger()
 
     _seed_everything(int(args.seed))
 
@@ -447,6 +465,14 @@ def main(argv: Optional[list[str]] = None) -> int:
                 row=[int(pictures_seen), int(batch_idx), float(loss_raw.detach().item())],
             )
 
+            if clearml_logger is not None:
+                clearml_logger.report_scalar(
+                    title="loss",
+                    series="train",
+                    iteration=int(pictures_seen),
+                    value=float(loss_raw.detach().item()),
+                )
+
             if pbar is not None:
                 pbar.set_postfix({"loss": f"{float(loss.item()):.4f}", "pics": int(pictures_seen)})
 
@@ -474,6 +500,13 @@ def main(argv: Optional[list[str]] = None) -> int:
                         header=["pictures_seen", "val_loss", "best_val", "use_ema_val"],
                         row=[int(pictures_seen), float(val_loss), float(best_val), (not bool(args.no_ema_val))],
                     )
+                    if clearml_logger is not None:
+                        clearml_logger.report_scalar(
+                            title="loss",
+                            series="val",
+                            iteration=int(pictures_seen),
+                            value=float(val_loss),
+                        )
                     next_val_at = int(next_val_at) + int(args.val_every_pictures)
 
         # Final validation at end (required when val_every_pictures==0).
@@ -500,6 +533,14 @@ def main(argv: Optional[list[str]] = None) -> int:
                 row=[int(pictures_seen), float(val_loss), float(best_val), (not bool(args.no_ema_val))],
             )
 
+            if clearml_logger is not None:
+                clearml_logger.report_scalar(
+                    title="loss",
+                    series="val",
+                    iteration=int(pictures_seen),
+                    value=float(val_loss),
+                )
+
         train_loss = running / max(1, len(train_loader))
         val_loss_summary = float(last_val_loss) if last_val_loss is not None else float(best_val)
         _append_csv_row(
@@ -512,6 +553,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         )
     else:
         # Epoch-based mode (original behavior)
+        global_step = 0
         for epoch in range(1, int(args.epochs) + 1):
             train_ds.set_epoch(epoch)
             model.train()
@@ -530,6 +572,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                 train_iter = pbar
 
             for step, (x, cond, mask) in enumerate(train_iter, start=1):
+                global_step += 1
                 x = x.to(device)
                 mask = mask.to(device)
                 cat, cont = cond
@@ -565,6 +608,14 @@ def main(argv: Optional[list[str]] = None) -> int:
                     row=[int(epoch), int(step), float(loss_raw.detach().item())],
                 )
 
+                if clearml_logger is not None:
+                    clearml_logger.report_scalar(
+                        title="loss",
+                        series="train",
+                        iteration=int(global_step),
+                        value=float(loss_raw.detach().item()),
+                    )
+
                 if pbar is not None:
                     pbar.set_postfix({"loss": f"{float(loss.item()):.4f}"})
 
@@ -573,6 +624,10 @@ def main(argv: Optional[list[str]] = None) -> int:
             print(
                 f"Epoch {epoch:04d} | train_loss={train_loss:.6f} | val_loss({'ema' if not bool(args.no_ema_val) else 'raw'})={val_loss:.6f}"
             )
+
+            if clearml_logger is not None:
+                clearml_logger.report_scalar(title="loss_epoch", series="train", iteration=int(epoch), value=float(train_loss))
+                clearml_logger.report_scalar(title="loss_epoch", series="val", iteration=int(epoch), value=float(val_loss))
 
             # Save validation pictures (cartesian images) for the selected validation samples.
             # We save the un-noised input image channel for quick visual sanity checks.
@@ -630,6 +685,13 @@ def main(argv: Optional[list[str]] = None) -> int:
                                 for si in range(gen_u8.shape[0]):
                                     outp = os.path.join(samples_dir, f"cond_{ci:02d}_sample_{si:02d}.png")
                                     cv2.imwrite(outp, gen_u8[si].numpy())
+                                    if clearml_logger is not None:
+                                        clearml_logger.report_image(
+                                            title="samples_training",
+                                            series=f"epoch_{epoch:04d}",
+                                            iteration=int(epoch),
+                                            local_path=outp,
+                                        )
 
                             # Write sampling metadata once per epoch.
                             meta = {
@@ -702,9 +764,3 @@ def main(argv: Optional[list[str]] = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-    p.add_argument(
-        "--slices-per-cell",
-        type=int,
-        default=1,
-        help="How many distinct slice depths per cell should be seen over the full training run.",
-    )
