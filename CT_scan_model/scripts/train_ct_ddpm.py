@@ -234,7 +234,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             task_name="tte-lre-master-ct-scan",  # this run
             task_type=Task.TaskTypes.training,
         )
-        clearml_task.execute_remotely(queue_name="bumblebee-a100-shared", clone_task_id=True)
+        # clearml_task.execute_remotely(queue_name="bumblebee-a100-shared", exit_process=True)
         clearml_task.connect(vars(args))
         clearml_logger = clearml_task.get_logger()
 

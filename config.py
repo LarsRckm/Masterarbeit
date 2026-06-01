@@ -41,6 +41,7 @@ UNET_IN_CHANNELS = 2
 UNET_OUT_CHANNELS = 1
 
 UNET_BASE_CHANNELS = 64
+# POLAR_UNET_BASE_CHANNELS = 96  # oder 128
 
 TIME_EMB_DIM = 512
 
@@ -71,3 +72,23 @@ COND_CAT_EMB_DIM = 64
 
 # Condition encoder output dimension. Usually match TIME_EMB_DIM.
 COND_EMB_OUT_DIM = TIME_EMB_DIM
+
+# -----------------------------------------------------------------------------
+# Polar representation (model input)
+# -----------------------------------------------------------------------------
+
+# Polar image dimensions: [N_r (height, radial), N_theta (width, angular)].
+# Both must be divisible by 2**UNET_NUM_DOWNS_POLAR.
+#   N_r = 512  → 512 / 2^5 = 16  ✓
+#   N_theta = 1024 → 1024 / 2^5 = 32  ✓
+POLAR_N_R = 512
+POLAR_N_THETA = 1024
+
+# Fill value for pixels outside the valid battery ring (r > r_valid).
+# Must be outside the normal image range [-1, 1].
+POLAR_PAD_VALUE = -2.0
+
+# Polar UNet: input channels = [polar_image, padding_mask].
+# Architecture is otherwise identical to the cartesian UNet.
+POLAR_UNET_IN_CHANNELS = 1
+UNET_NUM_DOWNS_POLAR = 5
