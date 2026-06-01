@@ -120,15 +120,17 @@ def sample_with_polar_mask(
 ) -> torch.Tensor:
     """DDPM sampling in polar space (c_in=1, no mask channel).
 
-    Since each cell fills all N_r rows (r_max = mean boundary radius), no row
-    clamping is needed.  The model has learned from training where the boundary
-    variance is and will produce the correct pad_value pattern.
+    r_valid_row corresponds to the widest boundary point (r_max = max boundary).
+    Rows beyond that are guaranteed padding and are clamped to pad_value after
+    every denoising step so the model never has to predict there.
 
     Returns the generated image: [n, 1, N_r, N_theta]
     """
     model.eval()
+    r_valid_row = int(round(float(r_valid_rel) * (N_r - 1)))
 
     x_img = torch.randn((n, 1, N_r, N_theta), device=device)
+    x_img[:, :, r_valid_row:, :] = float(pad_value)
 
     for i in reversed(range(1, diffusion.noise_steps)):
         t = torch.full((n,), i, device=device, dtype=torch.long)
@@ -147,6 +149,7 @@ def sample_with_polar_mask(
             * (x_img - ((1 - alpha) / torch.sqrt(1 - alpha_hat)) * pred)
             + torch.sqrt(beta) * noise
         )
+        x_img[:, :, r_valid_row:, :] = float(pad_value)
 
     model.train()
     return x_img
