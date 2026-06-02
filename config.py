@@ -86,9 +86,9 @@ POLAR_N_THETA = 1024
 
 # Fill value for pixels outside the valid battery ring (r > r_valid).
 # Must be outside the normal image range [-1, 1].
-POLAR_PAD_VALUE = -2.0
+POLAR_PAD_VALUE = 0.0
 
 # Polar UNet: input channels = [polar_image, padding_mask].
 # Architecture is otherwise identical to the cartesian UNet.
-POLAR_UNET_IN_CHANNELS = 1
+POLAR_UNET_IN_CHANNELS = 2
 UNET_NUM_DOWNS_POLAR = 5

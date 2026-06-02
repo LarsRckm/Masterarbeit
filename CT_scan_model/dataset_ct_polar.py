@@ -18,8 +18,9 @@ the actual, non-circular boundary is used to build the padding mask.
 
 Returns
 -------
-x    : float tensor [1, POLAR_N_R, POLAR_N_THETA]
+x    : float tensor [2, POLAR_N_R, POLAR_N_THETA]
          channel 0 — polar image,    normalised to [-1, 1]
+         channel 1 — padding mask,   1 inside cell boundary, 0 outside
 cond : tuple(cat, cont)
          cat  : long tensor [3] — (cell_format_id, manufacturer_id, chemistry_id)
          cont : float tensor [2] — (slice_depth_relative, r_valid_rel)
@@ -110,8 +111,8 @@ def _build_sample_tensor(
 
     Returns
     -------
-    x     : float32 tensor [1, N_r, N_theta]  (c_in=1, no mask channel)
-    mask  : float32 tensor [N_r, N_theta]     (1 inside boundary, 0 outside)
+    x     : float32 tensor [2, N_r, N_theta]  (channel 0: polar image, channel 1: mask)
+    mask  : float32 tensor [N_r, N_theta]     (1 inside boundary, 0 outside; same as channel 1)
     r_max : float — per-cell radial scale in original image pixels
     """
     img_norm = (gray.astype(np.float32) / 255.0) * 2.0 - 1.0
@@ -126,8 +127,9 @@ def _build_sample_tensor(
         pad_value=pad_value,
     )
 
-    x = torch.from_numpy(polar_img[np.newaxis]).to(dtype=torch.float32)  # [1, N_r, N_theta]
-    mask_t = torch.from_numpy(padding_mask)
+    polar_t = torch.from_numpy(polar_img).to(dtype=torch.float32)   # [N_r, N_theta]
+    mask_t  = torch.from_numpy(padding_mask).to(dtype=torch.float32) # [N_r, N_theta]
+    x = torch.stack([polar_t, mask_t], dim=0)                        # [2, N_r, N_theta]
     return x, mask_t, r_max
 
 

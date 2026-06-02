@@ -57,6 +57,7 @@ from ..dataset_ct_polar import (
 from ..diffusion_cartesian import Diffusion
 from ..modules_cartesian_ct import UNet_conditional_cartesian
 from ..polar_transform import polar_to_cart
+from .sample_ct_ddpm_polar import _sample_ddpm, _sample_ddim, _to_uint8_np
 
 try:
     from model import config as project_config
@@ -98,64 +99,6 @@ def masked_mse(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> 
 
 
 # ---------------------------------------------------------------------------
-# Sampling
-# ---------------------------------------------------------------------------
-
-def _to_uint8(img: torch.Tensor) -> torch.Tensor:
-    return ((img + 1.0) * 0.5 * 255.0).clamp(0, 255).to(torch.uint8)
-
-
-@torch.no_grad()
-def sample_with_polar_mask(
-    diffusion: Diffusion,
-    model: nn.Module,
-    n: int,
-    cond,
-    r_valid_rel: float,
-    N_r: int,
-    N_theta: int,
-    device: torch.device,
-    cfg_scale: float = 1.0,
-    pad_value: float = -2.0,
-) -> torch.Tensor:
-    """DDPM sampling in polar space (c_in=1, no mask channel).
-
-    r_valid_row corresponds to the widest boundary point (r_max = max boundary).
-    Rows beyond that are guaranteed padding and are clamped to pad_value after
-    every denoising step so the model never has to predict there.
-
-    Returns the generated image: [n, 1, N_r, N_theta]
-    """
-    model.eval()
-    r_valid_row = int(round(float(r_valid_rel) * (N_r - 1)))
-
-    x_img = torch.randn((n, 1, N_r, N_theta), device=device)
-    x_img[:, :, r_valid_row:, :] = float(pad_value)
-
-    for i in reversed(range(1, diffusion.noise_steps)):
-        t = torch.full((n,), i, device=device, dtype=torch.long)
-        pred = model(x_img, t, cond)
-
-        if float(cfg_scale) != 1.0:
-            uncond = model(x_img, t, None)
-            pred = uncond + float(cfg_scale) * (pred - uncond)
-
-        alpha     = diffusion.alpha[t][:, None, None, None]
-        alpha_hat = diffusion.alpha_hat[t][:, None, None, None]
-        beta      = diffusion.beta[t][:, None, None, None]
-        noise = torch.randn_like(x_img) if i > 1 else torch.zeros_like(x_img)
-        x_img = (
-            (1.0 / torch.sqrt(alpha))
-            * (x_img - ((1 - alpha) / torch.sqrt(1 - alpha_hat)) * pred)
-            + torch.sqrt(beta) * noise
-        )
-        x_img[:, :, r_valid_row:, :] = float(pad_value)
-
-    model.train()
-    return x_img
-
-
-# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
@@ -187,17 +130,13 @@ def _polar_sample_to_uint8_cart(
     N_theta: int,
     pad_value: float,
 ) -> "np.ndarray":
-    """Convert a single generated polar image tensor to a uint8 cartesian image.
-
-    r_max is reconstructed as r_valid_rel * (cart_size / 2) so the cell is
-    scaled to fill the output canvas.
-    """
+    """Convert a single generated polar image tensor to a uint8 cartesian image."""
     import numpy as np
     p = polar_img.cpu().numpy()
     cx = cy = cart_size / 2.0
     r_max = float(r_valid_rel) * (float(cart_size) / 2.0)
     cart = polar_to_cart(p, cx, cy, r_max, N_r, N_theta, cart_size, pad_value)
-    return ((cart + 1.0) * 0.5 * 255.0).clip(0, 255).astype(np.uint8)
+    return _to_uint8_np(cart)
 
 
 # ---------------------------------------------------------------------------
@@ -267,9 +206,20 @@ def main(argv: Optional[list] = None) -> int:
     p.add_argument("--save-every", type=int, default=1)
     p.add_argument("--tqdm", action="store_true", default=True)
 
+    p.add_argument("--resume", action="store_true",
+                   help="Resume training from a checkpoint in --run-dir")
+    p.add_argument("--resume-from", default=None,
+                   help="Explicit checkpoint path to resume from (overrides default search)")
+
     p.add_argument("--sample-every", type=int, default=20)
     p.add_argument("--sample-n", type=int, default=1)
     p.add_argument("--sample-cfg-scale", type=float, default=1.0)
+    p.add_argument("--sample-sampler", choices=["ddpm", "ddim"], default="ddpm",
+                   help="Sampler used for qualitative samples during training")
+    p.add_argument("--sample-ddim-steps", type=int, default=200,
+                   help="DDIM steps (only when --sample-sampler=ddim)")
+    p.add_argument("--sample-ddim-eta", type=float, default=0.0,
+                   help="DDIM eta: 0=deterministic, 1=full noise")
 
     p.add_argument("--no-clearml", action="store_true")
     args = p.parse_args(argv)
@@ -425,11 +375,50 @@ def main(argv: Optional[list] = None) -> int:
     scaler = torch.cuda.amp.GradScaler(enabled=torch.cuda.is_available())
 
     best_val = float("inf")
+    start_epoch = 1
+
+    # --- Resume from checkpoint ---
+    if bool(args.resume) or args.resume_from is not None:
+        if args.resume_from is not None:
+            ckpt_path = args.resume_from
+        else:
+            # Priority: checkpoint_best.pt → latest epoch checkpoint
+            ckpt_path = os.path.join(run_dir, "checkpoint_best.pt")
+            if not os.path.isfile(ckpt_path):
+                import glob as _glob
+                epoch_ckpts = sorted(
+                    _glob.glob(os.path.join(weights_dir, "checkpoint_epoch_*.pt"))
+                )
+                if epoch_ckpts:
+                    ckpt_path = epoch_ckpts[-1]
+                else:
+                    raise FileNotFoundError(
+                        f"No checkpoint found in {run_dir}. "
+                        "Pass --resume-from <path> to specify one explicitly."
+                    )
+
+        if not os.path.isfile(ckpt_path):
+            raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
+
+        print(f"Resuming from: {ckpt_path}")
+        ckpt = torch.load(ckpt_path, map_location=device)
+        model.load_state_dict(ckpt["model"])
+        ema_model.load_state_dict(ckpt["ema_model"])
+        optimizer.load_state_dict(ckpt["optimizer"])
+        best_val    = float(ckpt.get("best_val", float("inf")))
+        start_epoch = int(ckpt.get("epoch", 0)) + 1
+        print(f"  → continuing from epoch {start_epoch}  (best_val={best_val:.6f})")
+
+        if start_epoch > int(args.epochs) and int(args.max_pictures) <= 0:
+            raise ValueError(
+                f"Checkpoint epoch ({start_epoch - 1}) >= --epochs ({args.epochs}). "
+                "Increase --epochs to continue training."
+            )
 
     # --- Training loop (epoch-based) ---
     if int(args.max_pictures) <= 0:
-        global_step = 0
-        for epoch in range(1, int(args.epochs) + 1):
+        global_step = (start_epoch - 1) * len(train_loader)
+        for epoch in range(start_epoch, int(args.epochs) + 1):
             train_ds.set_epoch(epoch)
             model.train()
             optimizer.zero_grad(set_to_none=True)
@@ -522,8 +511,8 @@ def main(argv: Optional[list] = None) -> int:
                     samples_dir = os.path.join(run_dir, "samples_training", f"epoch_{epoch:04d}")
                     os.makedirs(samples_dir, exist_ok=True)
                     try:
+                        ema_model.eval()
                         with torch.no_grad():
-                            ema_model.eval()
                             cond_entries = []
                             for ci, (vx, vcond, vmask) in enumerate(val_loader):
                                 cat_v, cont_v = vcond
@@ -539,23 +528,30 @@ def main(argv: Optional[list] = None) -> int:
                                     "cont": cont_v[:1].cpu().tolist()[0],
                                 })
                                 r_valid_rel_cond = float(cont_v[0, 1].item())
-                                gen = sample_with_polar_mask(
-                                    diffusion=diffusion,
-                                    model=ema_model,
-                                    n=int(args.sample_n),
-                                    cond=cond_fixed,
-                                    r_valid_rel=r_valid_rel_cond,
-                                    N_r=N_r,
-                                    N_theta=N_theta,
-                                    device=device,
-                                    cfg_scale=float(args.sample_cfg_scale),
-                                    pad_value=pad_value,
+                                r_valid_row = int(round(r_valid_rel_cond * (N_r - 1)))
+
+                                # Use the actual mask from the val batch (from training data).
+                                # vmask: [B, N_r, N_theta] → take first sample, expand to [sample_n, 1, N_r, N_theta]
+                                mask_cond = vmask[:1, None].to(device=device, dtype=torch.float32)
+                                mask_cond = mask_cond.expand(int(args.sample_n), -1, -1, -1).contiguous()
+
+                                _sample_fn = _sample_ddim if args.sample_sampler == "ddim" else _sample_ddpm
+                                _sample_kwargs = dict(
+                                    model=ema_model, diffusion=diffusion, cond=cond_fixed,
+                                    n=int(args.sample_n), N_r=N_r, N_theta=N_theta,
+                                    r_valid_row=r_valid_row, pad_value=pad_value,
+                                    cfg_scale=float(args.sample_cfg_scale), device=device,
+                                    mask=mask_cond,
                                 )
+                                if args.sample_sampler == "ddim":
+                                    _sample_kwargs["ddim_steps"] = int(args.sample_ddim_steps)
+                                    _sample_kwargs["ddim_eta"]   = float(args.sample_ddim_eta)
+                                gen = _sample_fn(**_sample_kwargs)
                                 for si in range(gen.shape[0]):
                                     # Save polar sample.
-                                    gen_u8 = _to_uint8(gen[si, 0])
+                                    gen_u8 = _to_uint8_np(gen[si, 0].cpu().numpy())
                                     polar_path = os.path.join(samples_dir, f"cond{ci:02d}_s{si:02d}_polar.png")
-                                    cv2.imwrite(polar_path, gen_u8.numpy())
+                                    cv2.imwrite(polar_path, gen_u8)
 
                                     # Save back-projected cartesian sample.
                                     cart_u8 = _polar_sample_to_uint8_cart(
@@ -586,7 +582,9 @@ def main(argv: Optional[list] = None) -> int:
                                     "sampling_conditions": cond_entries,
                                 }, f, indent=2)
                     except Exception as e:
-                        warnings.warn(f"Qualitative sampling failed: {e}")
+                        import traceback
+                        print(f"[WARNING] Qualitative sampling failed: {e}")
+                        traceback.print_exc()
 
             if val_loss < best_val:
                 best_val = val_loss
