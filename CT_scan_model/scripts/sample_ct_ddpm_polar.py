@@ -95,6 +95,14 @@ def _build_mask(n: int, N_r: int, N_theta: int, r_valid_row: int, device: torch.
     return mask
 
 
+def _build_radial_map(n: int, N_r: int, N_theta: int, r_valid_row: int, device: torch.device) -> torch.Tensor:
+    """Build normalised radial position map: i/(N_r-1) inside r_valid_row, 0 outside."""
+    rows = torch.arange(N_r, device=device, dtype=torch.float32) / max(1.0, float(N_r - 1))
+    radial = rows[None, None, :, None].expand(n, 1, N_r, N_theta).clone()
+    radial[:, :, r_valid_row:, :] = 0.0
+    return radial
+
+
 @torch.no_grad()
 def _sample_ddpm(
     model: torch.nn.Module,
@@ -108,6 +116,7 @@ def _sample_ddpm(
     cfg_scale: float,
     device: torch.device,
     mask: torch.Tensor = None,
+    radial_map: torch.Tensor = None,
 ) -> torch.Tensor:
     """Full DDPM reverse process.
 
@@ -117,13 +126,15 @@ def _sample_ddpm(
     """
     if mask is None:
         mask = _build_mask(n, N_r, N_theta, r_valid_row, device)
+    if radial_map is None:
+        radial_map = _build_radial_map(n, N_r, N_theta, r_valid_row, device)
 
     x = torch.randn((n, 1, N_r, N_theta), device=device)
     x[:, :, r_valid_row:, :] = pad_value
 
     for i in reversed(range(1, diffusion.noise_steps)):
         t = torch.full((n,), i, device=device, dtype=torch.long)
-        model_in = torch.cat([x, mask], dim=1)   # [n, 2, N_r, N_theta]
+        model_in = torch.cat([x, mask, radial_map], dim=1)   # [n, 3, N_r, N_theta]
         pred = model(model_in, t, cond)
         if float(cfg_scale) != 1.0:
             uncond = model(model_in, t, None)
@@ -158,13 +169,16 @@ def _sample_ddim(
     ddim_steps: int,
     ddim_eta: float,
     mask: torch.Tensor = None,
+    radial_map: torch.Tensor = None,
 ) -> torch.Tensor:
     """DDIM reverse process (fewer steps).
 
-    mask is concatenated to the noisy image at every step (same as _sample_ddpm).
+    mask and radial_map are concatenated to the noisy image at every step.
     """
     if mask is None:
         mask = _build_mask(n, N_r, N_theta, r_valid_row, device)
+    if radial_map is None:
+        radial_map = _build_radial_map(n, N_r, N_theta, r_valid_row, device)
 
     skip = max(1, diffusion.noise_steps // ddim_steps)
     seq = list(range(1, diffusion.noise_steps, skip))
@@ -179,7 +193,7 @@ def _sample_ddim(
         t_next = seq[si - 1]
 
         t = torch.full((n,), t_i, device=device, dtype=torch.long)
-        model_in = torch.cat([x, mask], dim=1)   # [n, 2, N_r, N_theta]
+        model_in = torch.cat([x, mask, radial_map], dim=1)   # [n, 3, N_r, N_theta]
         pred = model(model_in, t, cond)
         if float(cfg_scale) != 1.0:
             uncond = model(model_in, t, None)
@@ -307,8 +321,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     r_valid_row = int(round(float(args.r_valid_rel) * (N_r - 1)))
     print(f"r_valid_row: {r_valid_row} / {N_r}  (r_valid_rel={args.r_valid_rel:.4f})")
 
-    # Uniform circular mask — 1 inside r_valid_row, 0 outside.
-    mask = _build_mask(int(args.n), N_r, N_theta, r_valid_row, device)
+    # Uniform circular mask + radial map built from r_valid_row.
+    mask       = _build_mask(      int(args.n), N_r, N_theta, r_valid_row, device)
+    radial_map = _build_radial_map(int(args.n), N_r, N_theta, r_valid_row, device)
 
     # --- Sample ---
     print(f"Sampling {args.n} image(s) with {args.sampler.upper()}...")
@@ -319,7 +334,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             r_valid_row=r_valid_row, pad_value=pad_value,
             cfg_scale=float(args.cfg_scale), device=device,
             ddim_steps=int(args.ddim_steps), ddim_eta=float(args.ddim_eta),
-            mask=mask,
+            mask=mask, radial_map=radial_map,
         )
     else:
         samples = _sample_ddpm(
@@ -327,7 +342,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             n=int(args.n), N_r=N_r, N_theta=N_theta,
             r_valid_row=r_valid_row, pad_value=pad_value,
             cfg_scale=float(args.cfg_scale), device=device,
-            mask=mask,
+            mask=mask, radial_map=radial_map,
         )
 
     # samples: [n, 1, N_r, N_theta] on device

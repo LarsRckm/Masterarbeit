@@ -90,5 +90,5 @@ POLAR_PAD_VALUE = 0.0
 
 # Polar UNet: input channels = [polar_image, padding_mask].
 # Architecture is otherwise identical to the cartesian UNet.
-POLAR_UNET_IN_CHANNELS = 2
+POLAR_UNET_IN_CHANNELS = 3   # polar_image | binary_mask | radial_map
 UNET_NUM_DOWNS_POLAR = 5

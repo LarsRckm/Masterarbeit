@@ -18,9 +18,10 @@ the actual, non-circular boundary is used to build the padding mask.
 
 Returns
 -------
-x    : float tensor [2, POLAR_N_R, POLAR_N_THETA]
+x    : float tensor [3, POLAR_N_R, POLAR_N_THETA]
          channel 0 — polar image,    normalised to [-1, 1]
          channel 1 — padding mask,   1 inside cell boundary, 0 outside
+         channel 2 — radial map,     i/(N_r-1) inside boundary, 0 outside
 cond : tuple(cat, cont)
          cat  : long tensor [3] — (cell_format_id, manufacturer_id, chemistry_id)
          cont : float tensor [2] — (slice_depth_relative, r_valid_rel)
@@ -32,7 +33,7 @@ Padding convention
 ------------------
 Row 0  → centre of battery (r = 0).
 Row N_r-1 → r = r_max (= max cell boundary radius in original image pixels).
-Pixels outside the detected cell boundary receive POLAR_PAD_VALUE (-2.0)
+Pixels outside the detected cell boundary receive POLAR_PAD_VALUE (0.0)
 and are masked out so they do not contribute to the loss.
 """
 
@@ -95,6 +96,51 @@ def _load_and_detect_boundary(
     return gray, cx, cy, r_valid_per_angle, image_half_size
 
 
+def _compute_region_weights(
+    polar_img: np.ndarray,
+    padding_mask: np.ndarray,
+    r_valid_row: int,
+    N_r: int,
+    w_mandrel: float = 3.0,
+    w_ring: float = 8.0,
+    sigma_mandrel: float = 12.0,
+    sigma_ring: float = 6.0,
+) -> np.ndarray:
+    """Per-pixel loss weight map boosting mandrel→layers and layers→ring transitions.
+
+    Returns
+    -------
+    weights : float32 [N_r, N_theta], values >= 1 inside cell, 0 outside
+    """
+    # Row-wise mean intensity (only valid pixels per row)
+    row_mean = np.zeros(N_r, dtype=np.float64)
+    for i in range(N_r):
+        valid = polar_img[i, padding_mask[i] > 0.5]
+        row_mean[i] = float(np.mean(valid)) if len(valid) > 0 else 0.0
+
+    # Moving-average smoothing (no scipy dependency)
+    k = 15
+    kernel = np.ones(k, dtype=np.float64) / k
+    row_mean_smooth = np.convolve(row_mean, kernel, mode="same")
+    grad = np.gradient(row_mean_smooth)
+
+    # Mandrel boundary: first significant positive peak in first 50% of valid rows
+    mand_end  = max(2, int(r_valid_row * 0.5))
+    threshold = float(np.max(np.abs(grad))) * 0.10
+    r_mandrel_row = int(np.argmax(grad[:mand_end]))
+    for i in range(1, mand_end - 1):
+        if (grad[i] > grad[i - 1] and grad[i] > grad[i + 1] and grad[i] > threshold):
+            r_mandrel_row = i
+            break
+
+    rows = np.arange(N_r, dtype=np.float32)
+    w  = np.ones(N_r, dtype=np.float32)
+    w += (w_mandrel - 1.0) * np.exp(-((rows - r_mandrel_row) / sigma_mandrel) ** 2)
+    w += (w_ring    - 1.0) * np.exp(-((rows - r_valid_row  ) / sigma_ring   ) ** 2)
+
+    return (w[:, np.newaxis] * padding_mask).astype(np.float32)
+
+
 def _build_sample_tensor(
     gray: np.ndarray,
     cx: float,
@@ -103,17 +149,16 @@ def _build_sample_tensor(
     N_r: int,
     N_theta: int,
     pad_value: float,
-) -> tuple[torch.Tensor, torch.Tensor, float]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, float]:
     """Convert an original-resolution greyscale image to a polar tensor.
-
-    The radial scale r_max = mean(r_valid_per_angle) is computed inside
-    cart_to_polar_boundary so that every cell fills all N_r rows.
 
     Returns
     -------
-    x     : float32 tensor [2, N_r, N_theta]  (channel 0: polar image, channel 1: mask)
-    mask  : float32 tensor [N_r, N_theta]     (1 inside boundary, 0 outside; same as channel 1)
-    r_max : float — per-cell radial scale in original image pixels
+    x              : float32 [3, N_r, N_theta]
+                       ch0 = polar image, ch1 = binary mask, ch2 = radial map
+    mask           : float32 [N_r, N_theta]  (1 inside boundary, 0 outside)
+    region_weights : float32 [N_r, N_theta]  (loss weights ≥ 1 inside, 0 outside)
+    r_max          : float — per-cell radial scale in original image pixels
     """
     img_norm = (gray.astype(np.float32) / 255.0) * 2.0 - 1.0
 
@@ -127,10 +172,21 @@ def _build_sample_tensor(
         pad_value=pad_value,
     )
 
-    polar_t = torch.from_numpy(polar_img).to(dtype=torch.float32)   # [N_r, N_theta]
-    mask_t  = torch.from_numpy(padding_mask).to(dtype=torch.float32) # [N_r, N_theta]
-    x = torch.stack([polar_t, mask_t], dim=0)                        # [2, N_r, N_theta]
-    return x, mask_t, r_max
+    # Radial map: normalised row index inside cell, 0 outside
+    row_idx    = np.arange(N_r, dtype=np.float32) / max(1.0, float(N_r - 1))
+    radial_map = row_idx[:, np.newaxis] * np.ones((1, N_theta), dtype=np.float32) * padding_mask
+
+    # Region weights
+    r_scale     = r_max / max(1.0, float(N_r - 1))
+    r_valid_row = min(N_r - 1, max(1, int(round(r_max / r_scale))))
+    region_weights = _compute_region_weights(polar_img, padding_mask, r_valid_row, N_r)
+
+    polar_t   = torch.from_numpy(polar_img).to(dtype=torch.float32)
+    mask_t    = torch.from_numpy(padding_mask).to(dtype=torch.float32)
+    radial_t  = torch.from_numpy(radial_map).to(dtype=torch.float32)
+    weights_t = torch.from_numpy(region_weights)
+    x = torch.stack([polar_t, mask_t, radial_t], dim=0)   # [3, N_r, N_theta]
+    return x, mask_t, weights_t, r_max
 
 
 def _build_conditioning(
@@ -256,12 +312,12 @@ class BatteryCTPolarPerCellDataset(Dataset):
         gray, cx, cy, r_valid_per_angle, image_half_size = _load_and_detect_boundary(
             img_path, self.N_theta,
         )
-        x, mask_t, r_max = _build_sample_tensor(
+        x, mask_t, weights_t, r_max = _build_sample_tensor(
             gray, cx, cy, r_valid_per_angle,
             self.N_r, self.N_theta, self.pad_value,
         )
         cat, cont = _build_conditioning(g, r_max, image_half_size, slice_depth_relative)
-        return x, (cat, cont), mask_t
+        return x, (cat, cont), mask_t, weights_t
 
 
 class BatteryCTPolarSelectedSamplesDataset(Dataset):
@@ -301,12 +357,12 @@ class BatteryCTPolarSelectedSamplesDataset(Dataset):
         gray, cx, cy, r_valid_per_angle, image_half_size = _load_and_detect_boundary(
             img_path, self.N_theta,
         )
-        x, mask_t, r_max = _build_sample_tensor(
+        x, mask_t, weights_t, r_max = _build_sample_tensor(
             gray, cx, cy, r_valid_per_angle,
             self.N_r, self.N_theta, self.pad_value,
         )
         cat, cont = _build_conditioning(g, r_max, image_half_size, slice_depth_relative)
-        return x, (cat, cont), mask_t
+        return x, (cat, cont), mask_t, weights_t
 
 
 class BatteryCTPolarUniformCellsMaxPicturesDataset(Dataset):
@@ -398,9 +454,9 @@ class BatteryCTPolarUniformCellsMaxPicturesDataset(Dataset):
         gray, cx, cy, r_valid_per_angle, image_half_size = _load_and_detect_boundary(
             img_path, self.N_theta,
         )
-        x, mask_t, r_max = _build_sample_tensor(
+        x, mask_t, weights_t, r_max = _build_sample_tensor(
             gray, cx, cy, r_valid_per_angle,
             self.N_r, self.N_theta, self.pad_value,
         )
         cat, cont = _build_conditioning(g, r_max, image_half_size, slice_depth_relative)
-        return x, (cat, cont), mask_t
+        return x, (cat, cont), mask_t, weights_t

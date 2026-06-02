@@ -41,11 +41,13 @@ class Diffusion:
         sqrt_alpha_hat = torch.sqrt(self.alpha_hat[t])[:, None, None, None]
         sqrt_one_minus_alpha_hat = torch.sqrt(1.0 - self.alpha_hat[t])[:, None, None, None]
 
-        if x.dim() == 4 and x.shape[1] == 2:
-            x_img, x_mask = x[:, :1], x[:, 1:]
+        if x.dim() == 4 and x.shape[1] >= 2:
+            # Channel 0 = image (noised), channels 1+ = mask/radial map (kept clean)
+            x_img  = x[:, :1]
+            x_rest = x[:, 1:]
             eps = torch.randn_like(x_img)
             x_noised = sqrt_alpha_hat * x_img + sqrt_one_minus_alpha_hat * eps
-            return torch.cat([x_noised, x_mask], dim=1), eps
+            return torch.cat([x_noised, x_rest], dim=1), eps
 
         eps = torch.randn_like(x)
         x_noised = sqrt_alpha_hat * x + sqrt_one_minus_alpha_hat * eps

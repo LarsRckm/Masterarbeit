@@ -22,6 +22,44 @@ except ImportError:  # pragma: no cover
     import config as project_config  # type: ignore
 
 
+class CircularPadConv2d(nn.Module):
+    """Conv2d with circular padding along the width axis (θ direction) and
+    zero padding along the height axis (r direction).
+
+    This ensures that the convolution kernel sees the correct neighbours at
+    the θ=0°/360° seam without introducing boundary artefacts.
+    """
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size: int = 3,
+        padding: int = 1,
+        dilation: int = 1,
+        bias: bool = False,
+    ):
+        super().__init__()
+        self.pad_h = int(padding)   # zero-pad in r direction (height)
+        self.pad_w = int(padding)   # circular-pad in θ direction (width)
+        self.conv = nn.Conv2d(
+            in_channels, out_channels,
+            kernel_size=kernel_size,
+            padding=0,
+            dilation=dilation,
+            bias=bias,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Circular padding in the width (θ) direction
+        if self.pad_w > 0:
+            x = F.pad(x, (self.pad_w, self.pad_w, 0, 0), mode="circular")
+        # Zero padding in the height (r) direction
+        if self.pad_h > 0:
+            x = F.pad(x, (0, 0, self.pad_h, self.pad_h), mode="constant", value=0.0)
+        return self.conv(x)
+
+
 class DoubleConv(nn.Module):
     def __init__(
         self,
@@ -39,9 +77,9 @@ class DoubleConv(nn.Module):
         d = int(max(1, dilation))
         pad = d
 
-        self.conv1 = nn.Conv2d(in_channels, mid_channels, kernel_size=3, padding=pad, dilation=d, bias=False)
+        self.conv1 = CircularPadConv2d(in_channels,  mid_channels,  kernel_size=3, padding=pad, dilation=d, bias=False)
         self.gn1 = nn.GroupNorm(1, mid_channels)
-        self.conv2 = nn.Conv2d(mid_channels, out_channels, kernel_size=3, padding=pad, dilation=d, bias=False)
+        self.conv2 = CircularPadConv2d(mid_channels, out_channels, kernel_size=3, padding=pad, dilation=d, bias=False)
         self.gn2 = nn.GroupNorm(1, out_channels)
         self.act = nn.GELU()
 

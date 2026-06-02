@@ -89,12 +89,20 @@ class EMA:
 # Loss
 # ---------------------------------------------------------------------------
 
-def masked_mse(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+def masked_mse(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor,
+               region_weights: torch.Tensor = None) -> torch.Tensor:
+    """Masked MSE loss, optionally weighted by per-pixel region weights."""
     if mask.dim() == 3:
         mask = mask[:, None, :, :]
     mask = mask.to(dtype=pred.dtype)
-    num = ((pred - target) ** 2 * mask).sum()
-    den = mask.sum().clamp_min(1.0)
+    if region_weights is not None:
+        if region_weights.dim() == 3:
+            region_weights = region_weights[:, None, :, :]
+        w = mask * region_weights.to(dtype=pred.dtype)
+    else:
+        w = mask
+    num = ((pred - target) ** 2 * w).sum()
+    den = w.sum().clamp_min(1.0)
     return num / den
 
 
@@ -156,17 +164,21 @@ def run_eval(
     total = 0.0
     count = 0
     with torch.no_grad():
-        for x, cond, mask in loader:
+        for batch in loader:
+            x, cond, mask = batch[0], batch[1], batch[2]
+            weights = batch[3] if len(batch) > 3 else None
             bs = int(x.shape[0])
             x = x.to(device)
             mask = mask.to(device)
+            if weights is not None:
+                weights = weights.to(device)
             cat, cont = cond
             cat = cat.to(device)
             cont = cont.to(device)
             t = diffusion.sample_timesteps(bs, device=device)
             x_t, noise = diffusion.noise_images(x, t)
             pred = net(x_t, t, (cat, cont))
-            loss = masked_mse(pred, noise, mask).item()
+            loss = masked_mse(pred, noise, mask, weights).item()
             total += float(loss) * bs
             count += bs
     net.train()
@@ -203,7 +215,7 @@ def main(argv: Optional[list] = None) -> int:
 
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--run-dir", default=None)
-    p.add_argument("--save-every", type=int, default=1)
+    p.add_argument("--save-every", type=int, default=10)
     p.add_argument("--tqdm", action="store_true", default=True)
 
     p.add_argument("--resume", action="store_true",
@@ -431,10 +443,14 @@ def main(argv: Optional[list] = None) -> int:
                 pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{int(args.epochs)}", unit="batch", leave=False)
                 train_iter = pbar
 
-            for step, (x, cond, mask) in enumerate(train_iter, start=1):
+            for step, batch in enumerate(train_iter, start=1):
+                x, cond, mask = batch[0], batch[1], batch[2]
+                weights = batch[3] if len(batch) > 3 else None
                 global_step += 1
                 x = x.to(device)
                 mask = mask.to(device)
+                if weights is not None:
+                    weights = weights.to(device)
                 cat, cont = cond
                 cat = cat.to(device)
                 cont = cont.to(device)
@@ -446,7 +462,7 @@ def main(argv: Optional[list] = None) -> int:
 
                 with torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):
                     pred = model(x_t, t, cond_in)
-                    loss_raw = masked_mse(pred, noise, mask)
+                    loss_raw = masked_mse(pred, noise, mask, weights)
                     loss = loss_raw / max(1, int(args.accumulation_steps))
 
                 scaler.scale(loss).backward()
@@ -480,7 +496,8 @@ def main(argv: Optional[list] = None) -> int:
             if cv2 is not None:
                 try:
                     with torch.no_grad():
-                        for j, (vx, vcond, _vmask) in enumerate(val_loader):
+                        for j, val_batch in enumerate(val_loader):
+                            vx, vcond = val_batch[0], val_batch[1]
                             polar_imgs = vx[:, 0].cpu().numpy()
                             _, vcont = vcond
                             for k in range(polar_imgs.shape[0]):
@@ -514,7 +531,8 @@ def main(argv: Optional[list] = None) -> int:
                         ema_model.eval()
                         with torch.no_grad():
                             cond_entries = []
-                            for ci, (vx, vcond, vmask) in enumerate(val_loader):
+                            for ci, val_batch in enumerate(val_loader):
+                                vx, vcond, vmask = val_batch[0], val_batch[1], val_batch[2]
                                 cat_v, cont_v = vcond
                                 cat_v = cat_v.to(device)
                                 cont_v = cont_v.to(device)
@@ -530,10 +548,11 @@ def main(argv: Optional[list] = None) -> int:
                                 r_valid_rel_cond = float(cont_v[0, 1].item())
                                 r_valid_row = int(round(r_valid_rel_cond * (N_r - 1)))
 
-                                # Use the actual mask from the val batch (from training data).
-                                # vmask: [B, N_r, N_theta] → take first sample, expand to [sample_n, 1, N_r, N_theta]
-                                mask_cond = vmask[:1, None].to(device=device, dtype=torch.float32)
-                                mask_cond = mask_cond.expand(int(args.sample_n), -1, -1, -1).contiguous()
+                                # Channel 1 = binary mask, channel 2 = radial map — from val batch
+                                mask_cond   = vx[:1, 1:2].to(device=device, dtype=torch.float32)
+                                radial_cond = vx[:1, 2:3].to(device=device, dtype=torch.float32)
+                                mask_cond   = mask_cond.expand(int(args.sample_n),   -1, -1, -1).contiguous()
+                                radial_cond = radial_cond.expand(int(args.sample_n), -1, -1, -1).contiguous()
 
                                 _sample_fn = _sample_ddim if args.sample_sampler == "ddim" else _sample_ddpm
                                 _sample_kwargs = dict(
@@ -541,7 +560,7 @@ def main(argv: Optional[list] = None) -> int:
                                     n=int(args.sample_n), N_r=N_r, N_theta=N_theta,
                                     r_valid_row=r_valid_row, pad_value=pad_value,
                                     cfg_scale=float(args.sample_cfg_scale), device=device,
-                                    mask=mask_cond,
+                                    mask=mask_cond, radial_map=radial_cond,
                                 )
                                 if args.sample_sampler == "ddim":
                                     _sample_kwargs["ddim_steps"] = int(args.sample_ddim_steps)
@@ -629,9 +648,13 @@ def main(argv: Optional[list] = None) -> int:
         optimizer.zero_grad(set_to_none=True)
         running = 0.0
 
-        for batch_idx, (x, cond, mask) in enumerate(train_iter, start=1):
+        for batch_idx, batch in enumerate(train_iter, start=1):
+            x, cond, mask = batch[0], batch[1], batch[2]
+            weights = batch[3] if len(batch) > 3 else None
             x = x.to(device)
             mask = mask.to(device)
+            if weights is not None:
+                weights = weights.to(device)
             cat, cont = cond
             cat = cat.to(device)
             cont = cont.to(device)
@@ -643,7 +666,7 @@ def main(argv: Optional[list] = None) -> int:
 
             with torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):
                 pred = model(x_t, t, cond_in)
-                loss_raw = masked_mse(pred, noise, mask)
+                loss_raw = masked_mse(pred, noise, mask, weights)
                 loss = loss_raw / max(1, int(args.accumulation_steps))
 
             scaler.scale(loss).backward()
