@@ -244,6 +244,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--ddim-eta",    type=float, default=0.0, help="DDIM eta: 0=deterministic, 1=full noise")
     p.add_argument("--cfg-scale",   type=float, default=1.0, help="Classifier-free guidance scale")
     p.add_argument("--noise-steps", type=int,   default=1000)
+    p.add_argument("--beta-schedule", choices=["linear", "cosine"], default="cosine",
+                   help="Must match the schedule used during training of --ckpt.")
     p.add_argument("--beta-start",  type=float, default=1e-4)
     p.add_argument("--beta-end",    type=float, default=0.02)
 
@@ -315,6 +317,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         noise_steps=int(args.noise_steps),
         beta_start=float(args.beta_start),
         beta_end=float(args.beta_end),
+        schedule=str(args.beta_schedule),
     ).to(device)
 
     # --- Row cutoff + mask from r_valid_rel ---

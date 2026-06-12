@@ -5,10 +5,26 @@ Diffusion is applied only to the image channel if input is [image, mask].
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Tuple
 
 import torch
+
+
+def _cosine_beta_schedule(noise_steps: int, s: float = 0.008, max_beta: float = 0.999) -> torch.Tensor:
+    """Cosine schedule for alpha_hat (Nichol & Dhariwal, 2021).
+
+    Spends relatively more steps in the low-noise regime than a linear
+    schedule, which helps preserve high-frequency detail (fine winding
+    lines, CT grain texture, sharp can edge).
+    """
+    steps = noise_steps + 1
+    t = torch.linspace(0, noise_steps, steps, dtype=torch.float64) / noise_steps
+    alphas_cumprod = torch.cos(((t + s) / (1.0 + s)) * math.pi * 0.5) ** 2
+    alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
+    betas = 1.0 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
+    return torch.clip(betas, 0.0, max_beta).to(dtype=torch.float32)
 
 
 @dataclass
@@ -16,9 +32,15 @@ class Diffusion:
     noise_steps: int = 1000
     beta_start: float = 1e-4
     beta_end: float = 0.02
+    schedule: str = "linear"
 
     def __post_init__(self):
-        self.beta = torch.linspace(self.beta_start, self.beta_end, self.noise_steps)
+        if self.schedule == "cosine":
+            self.beta = _cosine_beta_schedule(self.noise_steps)
+        elif self.schedule == "linear":
+            self.beta = torch.linspace(self.beta_start, self.beta_end, self.noise_steps)
+        else:
+            raise ValueError(f"Unknown schedule: {self.schedule!r} (expected 'linear' or 'cosine')")
         self.alpha = 1.0 - self.beta
         self.alpha_hat = torch.cumprod(self.alpha, dim=0)
 

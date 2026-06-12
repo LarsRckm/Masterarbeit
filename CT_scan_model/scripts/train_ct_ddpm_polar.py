@@ -207,16 +207,25 @@ def main(argv: Optional[list] = None) -> int:
     p.add_argument("--no-ema-val", action="store_true")
 
     p.add_argument("--noise-steps", type=int, default=1000)
+    p.add_argument("--beta-schedule", choices=["linear", "cosine"], default="cosine",
+                   help="Noise schedule. 'cosine' spends more steps in the low-noise regime, "
+                        "which helps preserve high-frequency detail (winding lines, CT grain, can edge).")
     p.add_argument("--beta-start", type=float, default=1e-4)
     p.add_argument("--beta-end", type=float, default=0.02)
 
-    p.add_argument("--ema-beta", type=float, default=0.995)
+    p.add_argument("--ema-beta", type=float, default=0.99,
+                   help="EMA decay. Lowered from 0.995 -> 0.99 so the EMA model reacts faster "
+                        "to fine, high-frequency structure instead of over-smoothing it.")
     p.add_argument("--p-uncond", type=float, default=0.1)
 
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--run-dir", default=None)
     p.add_argument("--save-every", type=int, default=10)
     p.add_argument("--tqdm", action="store_true", default=True)
+
+    p.add_argument("--early-stopping-patience", type=int, default=10,
+                   help="Stop training (epoch-based mode) if val_loss does not improve "
+                        "for this many consecutive epochs. Set to 0 to disable.")
 
     p.add_argument("--resume", action="store_true",
                    help="Resume training from a checkpoint in --run-dir")
@@ -233,7 +242,7 @@ def main(argv: Optional[list] = None) -> int:
     p.add_argument("--sample-ddim-eta", type=float, default=0.0,
                    help="DDIM eta: 0=deterministic, 1=full noise")
 
-    p.add_argument("--no-clearml", action="store_true")
+    p.add_argument("--no-clearml", action="store_true", default=True)
     args = p.parse_args(argv)
 
     # Polar config constants.
@@ -383,11 +392,13 @@ def main(argv: Optional[list] = None) -> int:
         noise_steps=int(args.noise_steps),
         beta_start=float(args.beta_start),
         beta_end=float(args.beta_end),
+        schedule=str(args.beta_schedule),
     ).to(device)
     scaler = torch.cuda.amp.GradScaler(enabled=torch.cuda.is_available())
 
     best_val = float("inf")
     start_epoch = 1
+    epochs_no_improve = 0
 
     # --- Resume from checkpoint ---
     if bool(args.resume) or args.resume_from is not None:
@@ -419,7 +430,9 @@ def main(argv: Optional[list] = None) -> int:
         optimizer.load_state_dict(ckpt["optimizer"])
         best_val    = float(ckpt.get("best_val", float("inf")))
         start_epoch = int(ckpt.get("epoch", 0)) + 1
-        print(f"  → continuing from epoch {start_epoch}  (best_val={best_val:.6f})")
+        epochs_no_improve = int(ckpt.get("epochs_no_improve", 0))
+        print(f"  → continuing from epoch {start_epoch}  (best_val={best_val:.6f}, "
+              f"epochs_no_improve={epochs_no_improve})")
 
         if start_epoch > int(args.epochs) and int(args.max_pictures) <= 0:
             raise ValueError(
@@ -607,14 +620,18 @@ def main(argv: Optional[list] = None) -> int:
 
             if val_loss < best_val:
                 best_val = val_loss
+                epochs_no_improve = 0
                 torch.save({
                     "epoch": epoch,
                     "model": model.state_dict(),
                     "ema_model": ema_model.state_dict(),
                     "optimizer": optimizer.state_dict(),
                     "best_val": best_val,
+                    "epochs_no_improve": epochs_no_improve,
                     "N_r": N_r, "N_theta": N_theta,
                 }, os.path.join(run_dir, "checkpoint_best.pt"))
+            else:
+                epochs_no_improve += 1
 
             _append_csv_row(
                 epoch_loss_csv,
@@ -628,8 +645,14 @@ def main(argv: Optional[list] = None) -> int:
                     "ema_model": ema_model.state_dict(),
                     "optimizer": optimizer.state_dict(),
                     "best_val": best_val,
+                    "epochs_no_improve": epochs_no_improve,
                     "N_r": N_r, "N_theta": N_theta,
                 }, os.path.join(weights_dir, f"checkpoint_epoch_{epoch:04d}.pt"))
+
+            if int(args.early_stopping_patience) > 0 and epochs_no_improve >= int(args.early_stopping_patience):
+                print(f"Early stopping: val_loss did not improve for {epochs_no_improve} epochs "
+                      f"(patience={args.early_stopping_patience}). Stopping at epoch {epoch}.")
+                break
 
     # --- Picture-budget training loop ---
     else:

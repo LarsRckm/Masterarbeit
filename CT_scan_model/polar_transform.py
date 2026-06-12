@@ -31,6 +31,20 @@ try:
 except ImportError:  # pragma: no cover
     cv2 = None
 
+try:
+    from scipy.ndimage import gaussian_filter1d  # type: ignore
+    _HAS_SCIPY = True
+except ImportError:  # pragma: no cover
+    _HAS_SCIPY = False
+
+
+def _smooth_profile(x: np.ndarray, sigma: float) -> np.ndarray:
+    """Smooth a 1-D profile with a Gaussian filter (falls back to moving average)."""
+    if _HAS_SCIPY:
+        return gaussian_filter1d(x.astype(np.float64), sigma=sigma)
+    k = max(1, int(sigma * 3))
+    return np.convolve(x.astype(np.float64), np.ones(k) / k, mode="same")
+
 
 # ---------------------------------------------------------------------------
 # Boundary detection (adapted from visualize_cell_mask.py)
@@ -284,3 +298,94 @@ def make_padding_mask(N_r: int, N_theta: int, r_valid_row: float) -> np.ndarray:
     rows = np.arange(N_r, dtype=np.float32)
     mask = (rows <= float(r_valid_row)).astype(np.float32)
     return np.broadcast_to(mask[:, None], (N_r, N_theta)).copy()
+
+
+# ---------------------------------------------------------------------------
+# Per-angle Mandrel / Ring (Can) boundary detection
+# ---------------------------------------------------------------------------
+
+def detect_regions_per_angle(
+    polar_img: np.ndarray,
+    padding_mask: np.ndarray,
+    r_valid_per_angle: np.ndarray,
+    r_scale: float,
+    n_trace_angles: int = 720,
+    smooth_sigma: float = 5.0,
+    ring_search_frac: float = 0.12,
+    mandrel_search_frac: float = 0.50,
+    min_peak_rel_height: float = 0.10,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Detect Mandrel- and Ring(Can)-boundary per angle from column gradients.
+
+    For each of ``n_trace_angles`` angles, the corresponding polar column is
+    read out, smoothed, and its radial gradient analysed:
+
+    - Ring boundary    : strongest positive gradient peak in the last
+                         ``ring_search_frac`` of the valid column range
+                         (the bright, high-absorption can wall).
+    - Mandrel boundary : first significant gradient peak in the first
+                         ``mandrel_search_frac`` of the valid column range
+                         (mandrel → jelly-roll transition).
+
+    The ``n_trace_angles`` raw values are then interpolated to ``N_theta``
+    bins (periodic), mirroring ``detect_cell_boundary``.
+
+    Returns
+    -------
+    r_mandrel_per_angle : float32 [N_theta] — Mandrel/Layer boundary row index
+    r_ring_per_angle    : float32 [N_theta] — Layer/Can boundary row index
+    """
+    N_r, N_theta = polar_img.shape
+
+    trace_angles_rad = np.linspace(0.0, 2.0 * math.pi, n_trace_angles, endpoint=False)
+    trace_cols = (trace_angles_rad / (2.0 * math.pi) * N_theta).astype(int) % N_theta
+
+    mandrel_trace = np.zeros(n_trace_angles, dtype=np.float32)
+    ring_trace    = np.zeros(n_trace_angles, dtype=np.float32)
+
+    for k, j in enumerate(trace_cols):
+        r_valid_j   = float(r_valid_per_angle[j])
+        r_valid_idx = min(N_r - 1, max(1, int(round(r_valid_j / max(1e-8, r_scale)))))
+
+        profile = polar_img[:r_valid_idx, j].astype(np.float64)
+        n = len(profile)
+        if n < 10:
+            ring_trace[k]    = float(r_valid_idx - 1)
+            mandrel_trace[k] = 0.0
+            continue
+
+        profile_smooth = _smooth_profile(profile, sigma=smooth_sigma)
+        grad           = np.gradient(profile_smooth)
+
+        # --- Ring boundary: strongest positive peak in the last ring_search_frac ---
+        ring_start = max(0, int(n * (1.0 - ring_search_frac)))
+        ring_local = grad[ring_start:]
+        ring_trace[k] = float(ring_start + int(np.argmax(ring_local)))
+
+        # --- Mandrel boundary: first significant peak in the first mandrel_search_frac ---
+        mandrel_end = max(2, int(n * mandrel_search_frac))
+        mand_region = grad[:mandrel_end]
+        threshold   = float(np.max(np.abs(grad))) * min_peak_rel_height
+
+        found = False
+        for i in range(1, mandrel_end - 1):
+            if (mand_region[i] > mand_region[i - 1] and
+                    mand_region[i] > mand_region[i + 1] and
+                    mand_region[i] > threshold):
+                mandrel_trace[k] = float(i)
+                found = True
+                break
+        if not found:
+            mandrel_trace[k] = float(int(np.argmax(mand_region)))
+
+    # --- Interpolate to N_theta bins (periodic) ---
+    theta_out   = np.linspace(0.0, 2.0 * math.pi, N_theta, endpoint=False)
+    angles_wrap = np.append(trace_angles_rad, trace_angles_rad[0] + 2.0 * math.pi)
+
+    m_wrap = np.append(mandrel_trace, mandrel_trace[0])
+    r_wrap = np.append(ring_trace,    ring_trace[0])
+
+    r_mandrel_per_angle = np.interp(theta_out, angles_wrap, m_wrap).astype(np.float32)
+    r_ring_per_angle    = np.interp(theta_out, angles_wrap, r_wrap).astype(np.float32)
+
+    return r_mandrel_per_angle, r_ring_per_angle

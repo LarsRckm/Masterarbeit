@@ -60,7 +60,7 @@ try:
 except ImportError:  # pragma: no cover
     import config as project_config  # type: ignore
 
-from .polar_transform import detect_cell_boundary, cart_to_polar_boundary
+from .polar_transform import detect_cell_boundary, cart_to_polar_boundary, detect_regions_per_angle
 from .dataset_ct_cartesian import _vocab_index
 
 
@@ -99,46 +99,50 @@ def _load_and_detect_boundary(
 def _compute_region_weights(
     polar_img: np.ndarray,
     padding_mask: np.ndarray,
-    r_valid_row: int,
+    r_valid_per_angle: np.ndarray,
+    r_scale: float,
     N_r: int,
+    N_theta: int,
     w_mandrel: float = 3.0,
+    w_layers: float = 1.0,
     w_ring: float = 8.0,
-    sigma_mandrel: float = 12.0,
-    sigma_ring: float = 6.0,
 ) -> np.ndarray:
-    """Per-pixel loss weight map boosting mandrel→layers and layers→ring transitions.
+    """Blockwise-constant per-pixel loss weight map with 3 per-angle regions.
+
+    Both region boundaries (Mandrel/Layer and Layer/Can) are detected
+    per angle via ``detect_regions_per_angle`` (column-gradient based,
+    mirrors ``detect_cell_boundary``'s per-angle approach), since neither
+    transition is a perfect circle in general.
+
+    For each angular column theta, the three radial regions each get ONE
+    constant weight (not just a narrow boost around the transition row):
+
+      rows <  r_mandrel_per_angle[theta]                            -> w_mandrel
+      r_mandrel_per_angle[theta] <= rows < r_ring_per_angle[theta]  -> w_layers
+      rows >= r_ring_per_angle[theta]  (and inside the cell)        -> w_ring
+
+    Outside the cell (padding_mask == 0) -> 0.
 
     Returns
     -------
-    weights : float32 [N_r, N_theta], values >= 1 inside cell, 0 outside
+    weights : float32 [N_r, N_theta]
     """
-    # Row-wise mean intensity (only valid pixels per row)
-    row_mean = np.zeros(N_r, dtype=np.float64)
-    for i in range(N_r):
-        valid = polar_img[i, padding_mask[i] > 0.5]
-        row_mean[i] = float(np.mean(valid)) if len(valid) > 0 else 0.0
+    r_mandrel_per_angle, r_ring_per_angle = detect_regions_per_angle(
+        polar_img, padding_mask, r_valid_per_angle, r_scale=r_scale,
+    )
 
-    # Moving-average smoothing (no scipy dependency)
-    k = 15
-    kernel = np.ones(k, dtype=np.float64) / k
-    row_mean_smooth = np.convolve(row_mean, kernel, mode="same")
-    grad = np.gradient(row_mean_smooth)
+    rows = np.arange(N_r, dtype=np.float32)[:, np.newaxis]   # [N_r, 1]
 
-    # Mandrel boundary: first significant positive peak in first 50% of valid rows
-    mand_end  = max(2, int(r_valid_row * 0.5))
-    threshold = float(np.max(np.abs(grad))) * 0.10
-    r_mandrel_row = int(np.argmax(grad[:mand_end]))
-    for i in range(1, mand_end - 1):
-        if (grad[i] > grad[i - 1] and grad[i] > grad[i + 1] and grad[i] > threshold):
-            r_mandrel_row = i
-            break
+    is_mandrel = rows < r_mandrel_per_angle[np.newaxis, :]
+    is_ring    = rows >= r_ring_per_angle[np.newaxis, :]
+    is_layers  = ~is_mandrel & ~is_ring
 
-    rows = np.arange(N_r, dtype=np.float32)
-    w  = np.ones(N_r, dtype=np.float32)
-    w += (w_mandrel - 1.0) * np.exp(-((rows - r_mandrel_row) / sigma_mandrel) ** 2)
-    w += (w_ring    - 1.0) * np.exp(-((rows - r_valid_row  ) / sigma_ring   ) ** 2)
+    w = np.zeros((N_r, N_theta), dtype=np.float32)
+    w[is_mandrel] = w_mandrel
+    w[is_layers]  = w_layers
+    w[is_ring]    = w_ring
 
-    return (w[:, np.newaxis] * padding_mask).astype(np.float32)
+    return (w * padding_mask).astype(np.float32)
 
 
 def _build_sample_tensor(
@@ -177,9 +181,10 @@ def _build_sample_tensor(
     radial_map = row_idx[:, np.newaxis] * np.ones((1, N_theta), dtype=np.float32) * padding_mask
 
     # Region weights
-    r_scale     = r_max / max(1.0, float(N_r - 1))
-    r_valid_row = min(N_r - 1, max(1, int(round(r_max / r_scale))))
-    region_weights = _compute_region_weights(polar_img, padding_mask, r_valid_row, N_r)
+    r_scale = r_max / max(1.0, float(N_r - 1))
+    region_weights = _compute_region_weights(
+        polar_img, padding_mask, r_valid_per_angle, r_scale, N_r, N_theta,
+    )
 
     polar_t   = torch.from_numpy(polar_img).to(dtype=torch.float32)
     mask_t    = torch.from_numpy(padding_mask).to(dtype=torch.float32)
