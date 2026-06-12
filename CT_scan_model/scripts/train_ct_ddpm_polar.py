@@ -196,8 +196,8 @@ def main(argv: Optional[list] = None) -> int:
     p.add_argument("--splits", default=os.path.join("CT_scan_model", "splits.json"))
 
     p.add_argument("--slices-per-cell", type=int, default=1)
-    p.add_argument("--epochs", type=int, default=0)
-    p.add_argument("--batch-size", type=int, default=8)
+    p.add_argument("--epochs", type=int, default=1000)
+    p.add_argument("--batch-size", type=int, default=4)
     p.add_argument("--lr", type=float, default=2e-4)
     p.add_argument("--accumulation-steps", type=int, default=1)
     p.add_argument("--num-workers", type=int, default=0)
@@ -220,7 +220,7 @@ def main(argv: Optional[list] = None) -> int:
 
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--run-dir", default=None)
-    p.add_argument("--save-every", type=int, default=10)
+    p.add_argument("--save-every", type=int, default=20)
     p.add_argument("--tqdm", action="store_true", default=True)
 
     p.add_argument("--early-stopping-patience", type=int, default=10,
@@ -232,7 +232,7 @@ def main(argv: Optional[list] = None) -> int:
     p.add_argument("--resume-from", default=None,
                    help="Explicit checkpoint path to resume from (overrides default search)")
 
-    p.add_argument("--sample-every", type=int, default=20)
+    p.add_argument("--sample-every", type=int, default=10)
     p.add_argument("--sample-n", type=int, default=1)
     p.add_argument("--sample-cfg-scale", type=float, default=1.0)
     p.add_argument("--sample-sampler", choices=["ddpm", "ddim"], default="ddpm",
