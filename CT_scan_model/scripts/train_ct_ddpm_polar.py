@@ -197,7 +197,7 @@ def main(argv: Optional[list] = None) -> int:
 
     p.add_argument("--slices-per-cell", type=int, default=1)
     p.add_argument("--epochs", type=int, default=1000)
-    p.add_argument("--batch-size", type=int, default=4)
+    p.add_argument("--batch-size", type=int, default=8)
     p.add_argument("--lr", type=float, default=2e-4)
     p.add_argument("--accumulation-steps", type=int, default=1)
     p.add_argument("--num-workers", type=int, default=0)
@@ -207,15 +207,16 @@ def main(argv: Optional[list] = None) -> int:
     p.add_argument("--no-ema-val", action="store_true")
 
     p.add_argument("--noise-steps", type=int, default=1000)
-    p.add_argument("--beta-schedule", choices=["linear", "cosine"], default="cosine",
-                   help="Noise schedule. 'cosine' spends more steps in the low-noise regime, "
-                        "which helps preserve high-frequency detail (winding lines, CT grain, can edge).")
+    p.add_argument("--beta-schedule", choices=["linear", "cosine"], default="linear",
+                   help="Noise schedule. Default 'linear' (V6). 'cosine' spends more steps in the "
+                        "low-noise regime but makes the DDPM reverse step unstable at high t "
+                        "(1/sqrt(alpha) blows up), which destabilised V7.")
     p.add_argument("--beta-start", type=float, default=1e-4)
     p.add_argument("--beta-end", type=float, default=0.02)
 
-    p.add_argument("--ema-beta", type=float, default=0.99,
-                   help="EMA decay. Lowered from 0.995 -> 0.99 so the EMA model reacts faster "
-                        "to fine, high-frequency structure instead of over-smoothing it.")
+    p.add_argument("--ema-beta", type=float, default=0.995,
+                   help="EMA decay (V6 value 0.995). Higher = smoother/more stable EMA model "
+                        "for the qualitative samples.")
     p.add_argument("--p-uncond", type=float, default=0.1)
 
     p.add_argument("--seed", type=int, default=42)
@@ -223,7 +224,7 @@ def main(argv: Optional[list] = None) -> int:
     p.add_argument("--save-every", type=int, default=20)
     p.add_argument("--tqdm", action="store_true", default=True)
 
-    p.add_argument("--early-stopping-patience", type=int, default=10,
+    p.add_argument("--early-stopping-patience", type=int, default=0,
                    help="Stop training (epoch-based mode) if val_loss does not improve "
                         "for this many consecutive epochs. Set to 0 to disable.")
 
@@ -233,7 +234,7 @@ def main(argv: Optional[list] = None) -> int:
                    help="Explicit checkpoint path to resume from (overrides default search)")
 
     p.add_argument("--sample-every", type=int, default=10)
-    p.add_argument("--sample-n", type=int, default=1)
+    p.add_argument("--sample-n", type=int, default=3)
     p.add_argument("--sample-cfg-scale", type=float, default=1.0)
     p.add_argument("--sample-sampler", choices=["ddpm", "ddim"], default="ddpm",
                    help="Sampler used for qualitative samples during training")

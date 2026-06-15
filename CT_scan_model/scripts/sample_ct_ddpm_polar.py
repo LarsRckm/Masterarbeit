@@ -40,6 +40,7 @@ try:
 except ImportError:  # pragma: no cover
     import config as project_config  # type: ignore
 
+from ..dataset_ct_polar import BatteryCTPolarPerCellDataset
 from ..diffusion_cartesian import Diffusion
 from ..modules_cartesian_ct import UNet_conditional_cartesian
 from ..polar_transform import polar_to_cart
@@ -230,13 +231,30 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--outdir", required=True, help="Output directory")
     p.add_argument("--n",      type=int, required=True, help="Number of samples to generate")
 
-    # Conditioning
-    p.add_argument("--cell-format",  required=True,        help=f"One of: {project_config.CELL_FORMAT_VOCAB}")
-    p.add_argument("--manufacturer", required=True,        help=f"One of: {project_config.MANUFACTURER_VOCAB}")
-    p.add_argument("--chemistry",    required=True,        help=f"One of: {project_config.CHEMISTRY_VOCAB}")
-    p.add_argument("--slice-depth",  type=float, required=True, help="Relative slice depth in [0, 1]")
-    p.add_argument("--r-valid-rel",  type=float, required=True,
+    # Conditioning (required UNLESS --mask-from-cell is used, which takes the
+    # conditioning from the real cell instead)
+    p.add_argument("--cell-format",  default=None,        help=f"One of: {project_config.CELL_FORMAT_VOCAB}")
+    p.add_argument("--manufacturer", default=None,        help=f"One of: {project_config.MANUFACTURER_VOCAB}")
+    p.add_argument("--chemistry",    default=None,        help=f"One of: {project_config.CHEMISTRY_VOCAB}")
+    p.add_argument("--slice-depth",  type=float, default=None, help="Relative slice depth in [0, 1]")
+    p.add_argument("--r-valid-rel",  type=float, default=None,
                    help="max(r_valid_per_angle) / image_half_size in (0, 1]")
+
+    # Variante B: take mask + radial map + conditioning from a REAL training cell
+    # (in-distribution conditioning, mirrors the qualitative sampling during training).
+    p.add_argument("--mask-from-cell", action="store_true",
+                   help="Extract the binary mask, radial map AND conditioning from a real "
+                        "training cell instead of synthesising a circular mask. This feeds the "
+                        "model in-distribution conditioning channels (fixes all-black samples).")
+    p.add_argument("--mask-cell-id", default=None,
+                   help="cell_id to take the mask/conditioning from (default: first train cell). "
+                        "Only used with --mask-from-cell.")
+    p.add_argument("--index",    default=os.path.join("CT_scan_model", "cell_index.json"),
+                   help="cell_index.json (only used with --mask-from-cell).")
+    p.add_argument("--geometry", default=os.path.join("CT_scan_model", "cell_geometry.json"),
+                   help="cell_geometry.json (only used with --mask-from-cell).")
+    p.add_argument("--splits",   default=os.path.join("CT_scan_model", "splits.json"),
+                   help="splits.json (only used with --mask-from-cell).")
 
     # Sampler
     p.add_argument("--sampler",     choices=["ddpm", "ddim"], default="ddpm")
@@ -244,8 +262,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--ddim-eta",    type=float, default=0.0, help="DDIM eta: 0=deterministic, 1=full noise")
     p.add_argument("--cfg-scale",   type=float, default=1.0, help="Classifier-free guidance scale")
     p.add_argument("--noise-steps", type=int,   default=1000)
-    p.add_argument("--beta-schedule", choices=["linear", "cosine"], default="cosine",
-                   help="Must match the schedule used during training of --ckpt.")
+    p.add_argument("--beta-schedule", choices=["linear", "cosine"], default="linear",
+                   help="Must match the schedule used during training of --ckpt (V6 default: linear).")
     p.add_argument("--beta-start",  type=float, default=1e-4)
     p.add_argument("--beta-end",    type=float, default=0.02)
 
@@ -260,14 +278,24 @@ def main(argv: Optional[List[str]] = None) -> int:
     # --- Validate ---
     if int(args.n) < 1:
         raise SystemExit("--n must be >= 1")
-    if not (0.0 <= float(args.slice_depth) <= 1.0):
-        raise SystemExit("--slice-depth must be in [0, 1]")
-    if not (0.0 < float(args.r_valid_rel) <= 1.0):
-        raise SystemExit("--r-valid-rel must be in (0, 1]")
 
-    cell_format  = _require_in_vocab("cell-format",  args.cell_format,  project_config.CELL_FORMAT_VOCAB)
-    manufacturer = _require_in_vocab("manufacturer", args.manufacturer, project_config.MANUFACTURER_VOCAB)
-    chemistry    = _require_in_vocab("chemistry",    args.chemistry,    project_config.CHEMISTRY_VOCAB)
+    cell_format = manufacturer = chemistry = None
+    if not bool(args.mask_from_cell):
+        missing = [name for name, val in [
+            ("--cell-format", args.cell_format), ("--manufacturer", args.manufacturer),
+            ("--chemistry", args.chemistry), ("--slice-depth", args.slice_depth),
+            ("--r-valid-rel", args.r_valid_rel),
+        ] if val is None]
+        if missing:
+            raise SystemExit(f"Missing required conditioning args (or use --mask-from-cell): {missing}")
+        if not (0.0 <= float(args.slice_depth) <= 1.0):
+            raise SystemExit("--slice-depth must be in [0, 1]")
+        if not (0.0 < float(args.r_valid_rel) <= 1.0):
+            raise SystemExit("--r-valid-rel must be in (0, 1]")
+
+        cell_format  = _require_in_vocab("cell-format",  args.cell_format,  project_config.CELL_FORMAT_VOCAB)
+        manufacturer = _require_in_vocab("manufacturer", args.manufacturer, project_config.MANUFACTURER_VOCAB)
+        chemistry    = _require_in_vocab("chemistry",    args.chemistry,    project_config.CHEMISTRY_VOCAB)
 
     # --- Config ---
     N_r       = int(getattr(project_config, "POLAR_N_R",       512))
@@ -282,18 +310,62 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     os.makedirs(args.outdir, exist_ok=True)
 
-    # --- Conditioning tensors ---
-    cat_ids = [
-        _vocab_index(project_config.CELL_FORMAT_VOCAB,  cell_format),
-        _vocab_index(project_config.MANUFACTURER_VOCAB, manufacturer),
-        _vocab_index(project_config.CHEMISTRY_VOCAB,    chemistry),
-    ]
-    cat  = torch.tensor(cat_ids, dtype=torch.long,    device=device)[None].repeat(int(args.n), 1)
-    cont = torch.tensor(
-        [float(args.slice_depth), float(args.r_valid_rel)],
-        dtype=torch.float32, device=device,
-    )[None].repeat(int(args.n), 1)
-    cond = (cat, cont)
+    # --- Conditioning + mask/radial map ---
+    mask = None
+    radial_map = None
+    if bool(args.mask_from_cell):
+        # Variante B: take mask + radial map + conditioning from a real training
+        # cell so the model receives in-distribution conditioning channels (this
+        # mirrors the qualitative sampling done during training).
+        ds = BatteryCTPolarPerCellDataset(
+            args.index, args.geometry, splits_json=args.splits, split="train",
+            batch_size=1, seed=int(args.seed), pad_to_batch=False,
+        )
+        if args.mask_cell_id is not None:
+            if args.mask_cell_id not in ds.cell_ids:
+                raise SystemExit(
+                    f"--mask-cell-id '{args.mask_cell_id}' not in train split. "
+                    f"Available (first 10): {ds.cell_ids[:10]}"
+                )
+            cell_idx = ds.cell_ids.index(args.mask_cell_id)
+        else:
+            cell_idx = 0
+        used_cell_id = ds.cell_ids[cell_idx]
+
+        x_real, (cat_real, cont_real), _mask_t, _w = ds[cell_idx]
+        # Channels: 0 = polar image (unused), 1 = binary mask, 2 = radial map.
+        mask_cond   = x_real[1:2].to(device=device, dtype=torch.float32)
+        radial_cond = x_real[2:3].to(device=device, dtype=torch.float32)
+        mask       = mask_cond[None].expand(int(args.n),   -1, -1, -1).contiguous()
+        radial_map = radial_cond[None].expand(int(args.n), -1, -1, -1).contiguous()
+
+        cat  = cat_real.to(device=device, dtype=torch.long)[None].repeat(int(args.n), 1)
+        cont = cont_real.to(device=device, dtype=torch.float32)[None].repeat(int(args.n), 1)
+        cond = (cat, cont)
+
+        slice_depth_used = float(cont_real[0].item())
+        r_valid_rel_used = float(cont_real[1].item())
+        cell_format  = project_config.CELL_FORMAT_VOCAB[int(cat_real[0].item())]
+        manufacturer = project_config.MANUFACTURER_VOCAB[int(cat_real[1].item())]
+        chemistry    = project_config.CHEMISTRY_VOCAB[int(cat_real[2].item())]
+        print(f"Variante B: mask + conditioning from train cell '{used_cell_id}'  "
+              f"(format={cell_format}, manuf={manufacturer}, chem={chemistry}, "
+              f"slice_depth={slice_depth_used:.4f}, r_valid_rel={r_valid_rel_used:.4f})")
+    else:
+        used_cell_id = None
+        slice_depth_used = float(args.slice_depth)
+        r_valid_rel_used = float(args.r_valid_rel)
+        cat_ids = [
+            _vocab_index(project_config.CELL_FORMAT_VOCAB,  cell_format),
+            _vocab_index(project_config.MANUFACTURER_VOCAB, manufacturer),
+            _vocab_index(project_config.CHEMISTRY_VOCAB,    chemistry),
+        ]
+        cat  = torch.tensor(cat_ids, dtype=torch.long,    device=device)[None].repeat(int(args.n), 1)
+        cont = torch.tensor(
+            [slice_depth_used, r_valid_rel_used],
+            dtype=torch.float32, device=device,
+        )[None].repeat(int(args.n), 1)
+        cond = (cat, cont)
 
     # --- Load checkpoint ---
     if not os.path.isfile(args.ckpt):
@@ -320,13 +392,14 @@ def main(argv: Optional[List[str]] = None) -> int:
         schedule=str(args.beta_schedule),
     ).to(device)
 
-    # --- Row cutoff + mask from r_valid_rel ---
-    r_valid_row = int(round(float(args.r_valid_rel) * (N_r - 1)))
-    print(f"r_valid_row: {r_valid_row} / {N_r}  (r_valid_rel={args.r_valid_rel:.4f})")
+    # --- Row cutoff (padding region) ---
+    r_valid_row = int(round(float(r_valid_rel_used) * (N_r - 1)))
+    print(f"r_valid_row: {r_valid_row} / {N_r}  (r_valid_rel={r_valid_rel_used:.4f})")
 
-    # Uniform circular mask + radial map built from r_valid_row.
-    mask       = _build_mask(      int(args.n), N_r, N_theta, r_valid_row, device)
-    radial_map = _build_radial_map(int(args.n), N_r, N_theta, r_valid_row, device)
+    if mask is None:
+        # Fallback: synthetic uniform circular mask + radial map (no real cell).
+        mask       = _build_mask(      int(args.n), N_r, N_theta, r_valid_row, device)
+        radial_map = _build_radial_map(int(args.n), N_r, N_theta, r_valid_row, device)
 
     # --- Sample ---
     print(f"Sampling {args.n} image(s) with {args.sampler.upper()}...")
@@ -355,7 +428,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         raise SystemExit("OpenCV (cv2) is required to save PNG outputs.")
 
     cx = cy = float(cart_size) / 2.0
-    r_max = float(args.r_valid_rel) * cx  # scale for back-projection
+    r_max = float(r_valid_rel_used) * cx  # scale for back-projection
 
     for i in range(int(args.n)):
         polar_np = samples_np[i]  # [N_r, N_theta]
@@ -393,12 +466,14 @@ def main(argv: Optional[List[str]] = None) -> int:
         "pad_value": pad_value,
         "r_valid_row": r_valid_row,
         "cart_size": cart_size,
+        "mask_from_cell": bool(args.mask_from_cell),
+        "mask_cell_id": used_cell_id,
         "conditions": {
             "cell_format": cell_format,
             "manufacturer": manufacturer,
             "chemistry": chemistry,
-            "slice_depth": float(args.slice_depth),
-            "r_valid_rel": float(args.r_valid_rel),
+            "slice_depth": float(slice_depth_used),
+            "r_valid_rel": float(r_valid_rel_used),
         },
     }
     meta_path = os.path.join(args.outdir, "metadata.json")

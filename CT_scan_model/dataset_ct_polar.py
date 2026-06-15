@@ -103,25 +103,29 @@ def _compute_region_weights(
     r_scale: float,
     N_r: int,
     N_theta: int,
+    half_width: int = 5,
     w_mandrel: float = 3.0,
-    w_layers: float = 1.0,
     w_ring: float = 8.0,
+    w_base: float = 1.0,
 ) -> np.ndarray:
-    """Blockwise-constant per-pixel loss weight map with 3 per-angle regions.
+    """Per-pixel loss weight map boosting only the per-angle TRANSITION corridors.
 
-    Both region boundaries (Mandrel/Layer and Layer/Can) are detected
-    per angle via ``detect_regions_per_angle`` (column-gradient based,
-    mirrors ``detect_cell_boundary``'s per-angle approach), since neither
-    transition is a perfect circle in general.
+    Both transition curves (Mandrel/Layer and Layer/Can) are detected per angle
+    via ``detect_regions_per_angle`` (column-gradient based, mirrors
+    ``detect_cell_boundary``'s per-angle approach), since neither transition is
+    a perfect circle in general.
 
-    For each angular column theta, the three radial regions each get ONE
-    constant weight (not just a narrow boost around the transition row):
+    Unlike the blockwise-constant variant (which up-weighted the entire region),
+    here only a narrow corridor of ±half_width rows around each transition curve
+    is boosted — this concentrates the loss on the sharp edges (V6 philosophy)
+    instead of starving the high-frequency winding region:
 
-      rows <  r_mandrel_per_angle[theta]                            -> w_mandrel
-      r_mandrel_per_angle[theta] <= rows < r_ring_per_angle[theta]  -> w_layers
-      rows >= r_ring_per_angle[theta]  (and inside the cell)        -> w_ring
+      |rows - r_mandrel_per_angle[theta]| <= half_width  -> w_mandrel (edge)
+      |rows - r_ring_per_angle[theta]|    <= half_width  -> w_ring    (edge)
+      else (inside the cell)                             -> w_base
+      outside the cell (padding_mask == 0)               -> 0
 
-    Outside the cell (padding_mask == 0) -> 0.
+    On overlap the Ring/Can corridor wins (w_ring).
 
     Returns
     -------
@@ -133,14 +137,13 @@ def _compute_region_weights(
 
     rows = np.arange(N_r, dtype=np.float32)[:, np.newaxis]   # [N_r, 1]
 
-    is_mandrel = rows < r_mandrel_per_angle[np.newaxis, :]
-    is_ring    = rows >= r_ring_per_angle[np.newaxis, :]
-    is_layers  = ~is_mandrel & ~is_ring
+    w = np.full((N_r, N_theta), float(w_base), dtype=np.float32)
 
-    w = np.zeros((N_r, N_theta), dtype=np.float32)
-    w[is_mandrel] = w_mandrel
-    w[is_layers]  = w_layers
-    w[is_ring]    = w_ring
+    d_mandrel = np.abs(rows - r_mandrel_per_angle[np.newaxis, :])
+    d_ring    = np.abs(rows - r_ring_per_angle[np.newaxis, :])
+
+    w[d_mandrel <= float(half_width)] = float(w_mandrel)
+    w[d_ring    <= float(half_width)] = float(w_ring)   # Ring overrides on overlap
 
     return (w * padding_mask).astype(np.float32)
 

@@ -14,12 +14,18 @@ Usage
   python test_region_detection.py              # Dateidialog
   python test_region_detection.py image.png    # expliziter Pfad
 
+Übergangsintervall
+------------------
+Um jede der beiden Übergangsgrenzen (Mandrel↔Schichten, Schichten↔Gehäuse)
+wird zusätzlich ein Korridor von ±HW Zeilenindizes (Default HW=5) als
+"Übergangsintervall" gebildet und in allen Figuren eingezeichnet.
+
 Figures
 -------
-Figure 1 — Polarbild mit per-Winkel-Grenzkurven
-Figure 2 — Radiales Profil + Gradient für einen einzelnen Winkel (Debug)
-Figure 3 — Kartesische Rückprojektion mit eingezeichneten Konturen
-Figure 4 — 3-Klassen-Maske (polar + kartesisch)
+Figure 1 — Polarbild mit per-Winkel-Grenzkurven + ±5-Korridor (Band)
+Figure 2 — Radiales Profil + Gradient für einen einzelnen Winkel (Debug) + Korridor
+Figure 3 — Kartesische Rückprojektion mit Konturen + ringförmigem ±5-Korridor
+Figure 4 — Variabilität der Grenzkurven pro Winkel + ±5-Korridorlinien
 """
 
 from __future__ import annotations
@@ -161,10 +167,20 @@ def detect_regions_per_angle(
         profile_smooth = _smooth(profile, sigma=smooth_sigma)
         grad           = np.gradient(profile_smooth)
 
-        # --- Ring-Grenze: stärkstes positives Peak im letzten ring_search_frac ---
-        ring_start = max(0, int(n * (1.0 - ring_search_frac)))
-        ring_local = grad[ring_start:]
-        ring_trace[k] = float(ring_start + int(np.argmax(ring_local)))
+        # --- Ring-Grenze: letztes signifikantes Peak im letzten ring_search_frac ---
+        ring_start = max(1, int(n * (1.0 - ring_search_frac)))
+        threshold  = float(np.max(np.abs(grad))) * min_peak_rel_height
+        found = False
+        for i in range(n - 2, ring_start - 1, -1):
+            if (grad[i] > grad[i - 1] and
+                    grad[i] > grad[i + 1] and
+                    grad[i] > threshold):
+                ring_trace[k] = float(i)
+                found = True
+                break
+        if not found:
+            ring_local = grad[ring_start:]
+            ring_trace[k] = float(ring_start + int(np.argmax(ring_local)))
 
         # --- Mandrel-Grenze: erstes signifikantes Peak im ersten mandrel_search_frac ---
         mandrel_end  = max(2, int(n * mandrel_search_frac))
@@ -231,6 +247,34 @@ def build_three_class_mask(
     return cls
 
 
+def build_transition_band_mask(
+    padding_mask: np.ndarray,
+    r_mandrel_per_angle: np.ndarray,
+    r_ring_per_angle: np.ndarray,
+    half_width: int = 5,
+) -> np.ndarray:
+    """Übergangsintervall-Maske: Korridor von ±half_width Zeilen um die Grenzen.
+
+    Pro Winkel wird ein Band von [grenze - half_width, grenze + half_width]
+    Zeilen markiert (nur innerhalb der Zelle):
+
+      1 = Mandrel↔Schichten-Korridor
+      2 = Schichten↔Gehäuse-Korridor
+      0 = außerhalb der Korridore / Padding
+
+    (Überlappen beide Korridore, gewinnt der Ring-Korridor = 2.)
+    """
+    N_r, N_theta = padding_mask.shape
+    rows  = np.arange(N_r, dtype=np.float32)[:, np.newaxis]   # [N_r, 1]
+    valid = padding_mask > 0.5
+    d_m = np.abs(rows - r_mandrel_per_angle[np.newaxis, :])
+    d_r = np.abs(rows - r_ring_per_angle[np.newaxis, :])
+    band = np.zeros((N_r, N_theta), dtype=np.uint8)
+    band[valid & (d_m <= float(half_width))] = 1
+    band[valid & (d_r <= float(half_width))] = 2
+    return band
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -250,6 +294,9 @@ def main() -> None:
     N_r     = int(getattr(project_config, "POLAR_N_R",    512))
     N_theta = int(getattr(project_config, "POLAR_N_THETA", 1024))
     pad_val = float(getattr(project_config, "POLAR_PAD_VALUE", 0.0))
+
+    # Übergangsintervall: Korridor von ±HW Zeilen um jede Übergangsgrenze
+    HW = 5
 
     # --- Bild laden ---
     gray = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
@@ -289,6 +336,14 @@ def main() -> None:
     # --- 3-Klassen-Maske ---
     cls_mask = build_three_class_mask(padding_mask, r_mandrel_per_angle, r_ring_per_angle)
 
+    # --- Übergangs-Korridor (±HW Zeilen) als Maske ---
+    band_mask = build_transition_band_mask(
+        padding_mask, r_mandrel_per_angle, r_ring_per_angle, half_width=HW,
+    )
+    print(f"Übergangs-Korridor ±{HW} Zeilen:  "
+          f"Mandrel↔Schichten={int((band_mask == 1).sum())} px,  "
+          f"Schichten↔Gehäuse={int((band_mask == 2).sum())} px")
+
     # Darstellung
     theta_deg   = np.linspace(0, 360, N_theta, endpoint=False)
     r_valid_rows = r_valid_per_angle / r_scale
@@ -316,6 +371,13 @@ def main() -> None:
 
     axes1[0].imshow(polar_u8, cmap="gray", vmin=0, vmax=255,
                     aspect="auto", extent=ext)
+    # Übergangsintervall: ±HW Zeilen Korridor um beide Grenzen
+    axes1[0].fill_between(theta_deg, r_mandrel_per_angle - HW, r_mandrel_per_angle + HW,
+                          color="dodgerblue", alpha=0.30, linewidth=0,
+                          label=f"Mandrel↔Schichten-Korridor (±{HW})")
+    axes1[0].fill_between(theta_deg, r_ring_per_angle - HW, r_ring_per_angle + HW,
+                          color="tomato", alpha=0.30, linewidth=0,
+                          label=f"Schichten↔Gehäuse-Korridor (±{HW})")
     axes1[0].plot(theta_deg, r_mandrel_per_angle, color="dodgerblue", linewidth=1.8,
                   label=f"Mandrel-Grenze (μ={r_mandrel_per_angle.mean():.0f})")
     axes1[0].plot(theta_deg, r_ring_per_angle,    color="tomato",     linewidth=1.8,
@@ -358,8 +420,17 @@ def main() -> None:
         prof_smooth = _smooth(profile, sigma=5.0)
         grad        = np.gradient(prof_smooth)
         # Ring
-        ring_start  = max(0, int(n * (1.0 - 0.12)))
-        r_ring      = ring_start + int(np.argmax(grad[ring_start:]))
+        ring_start  = max(1, int(n * (1.0 - 0.12)))
+        threshold   = float(np.max(np.abs(grad))) * 0.10
+        found_ring  = False
+        for i in range(n - 2, ring_start - 1, -1):
+            if (grad[i] > grad[i - 1] and grad[i] > grad[i + 1]
+                    and grad[i] > threshold):
+                r_ring = i
+                found_ring = True
+                break
+        if not found_ring:
+            r_ring = ring_start + int(np.argmax(grad[ring_start:]))
         # Mandrel
         mand_end    = max(2, int(n * 0.50))
         threshold   = float(np.max(np.abs(grad))) * 0.10
@@ -389,6 +460,11 @@ def main() -> None:
         ax_prof.axhspan(0,   r_m, color="dodgerblue", alpha=0.08)
         ax_prof.axhspan(r_m, r_r, color="green",      alpha=0.06)
         ax_prof.axhspan(r_r, n,   color="tomato",      alpha=0.10)
+        # Übergangsintervall ±HW
+        ax_prof.axhspan(max(0, r_m - HW), min(n, r_m + HW), color="dodgerblue", alpha=0.30,
+                        label=f"Mandrel-Korridor ±{HW}")
+        ax_prof.axhspan(max(0, r_r - HW), min(n, r_r + HW), color="tomato", alpha=0.30,
+                        label=f"Gehäuse-Korridor ±{HW}")
         ax_prof.set_xlabel("Intensität [-1, 1]", fontsize=10)
         ax_prof.set_ylabel("Zeilen-Index (Radius r)", fontsize=10)
         ax_prof.set_title("Intensitätsprofil")
@@ -408,6 +484,11 @@ def main() -> None:
         ax_grad.axhspan(0,   r_m, color="dodgerblue", alpha=0.08)
         ax_grad.axhspan(r_m, r_r, color="green",      alpha=0.06)
         ax_grad.axhspan(r_r, n,   color="tomato",      alpha=0.10)
+        # Übergangsintervall ±HW
+        ax_grad.axhspan(max(0, r_m - HW), min(n, r_m + HW), color="dodgerblue", alpha=0.30,
+                        label=f"Mandrel-Korridor ±{HW}")
+        ax_grad.axhspan(max(0, r_r - HW), min(n, r_r + HW), color="tomato", alpha=0.30,
+                        label=f"Gehäuse-Korridor ±{HW}")
         ax_grad.set_xlabel("dI/dr (Änderungsrate)", fontsize=10)
         ax_grad.set_ylabel("Zeilen-Index (Radius r)", fontsize=10)
         ax_grad.set_title("Gradient → Peak = Übergang")
@@ -485,6 +566,18 @@ def main() -> None:
     xs_m, ys_m = polar_boundary_to_cart(r_mandrel_per_angle, r_scale, cx, cy, N_theta)
     xs_r, ys_r = polar_boundary_to_cart(r_ring_per_angle,    r_scale, cx, cy, N_theta)
 
+    # Korridor-Kurven (±HW Zeilen) → kartesisch, für ringförmige Füllung
+    xs_m_in,  ys_m_in  = polar_boundary_to_cart(np.maximum(r_mandrel_per_angle - HW, 0.0), r_scale, cx, cy, N_theta)
+    xs_m_out, ys_m_out = polar_boundary_to_cart(r_mandrel_per_angle + HW, r_scale, cx, cy, N_theta)
+    xs_r_in,  ys_r_in  = polar_boundary_to_cart(np.maximum(r_ring_per_angle - HW, 0.0), r_scale, cx, cy, N_theta)
+    xs_r_out, ys_r_out = polar_boundary_to_cart(r_ring_per_angle + HW, r_scale, cx, cy, N_theta)
+
+    def _annulus_poly(xs_in, ys_in, xs_out, ys_out):
+        """Polygon für die ringförmige Fläche zwischen innerer und äußerer Kurve."""
+        px = np.concatenate([xs_out, xs_out[:1], xs_in[::-1], xs_in[-1:]])
+        py = np.concatenate([ys_out, ys_out[:1], ys_in[::-1], ys_in[-1:]])
+        return px, py
+
     if len(edge_pts_xy) >= 3:
         bx = np.append(edge_pts_xy[:, 0], edge_pts_xy[0, 0])
         by = np.append(edge_pts_xy[:, 1], edge_pts_xy[0, 1])
@@ -493,6 +586,13 @@ def main() -> None:
     fig3.suptitle("Kartesische Ansicht — per-Winkel Regionsgrenzen", fontsize=13)
 
     axes3[0].imshow(gray, cmap="gray", vmin=0, vmax=255)
+    # Übergangsintervall ±HW als ringförmige Füllung
+    pm_x, pm_y = _annulus_poly(xs_m_in, ys_m_in, xs_m_out, ys_m_out)
+    pr_x, pr_y = _annulus_poly(xs_r_in, ys_r_in, xs_r_out, ys_r_out)
+    axes3[0].fill(pm_x, pm_y, color="dodgerblue", alpha=0.30, linewidth=0,
+                  label=f"Mandrel↔Schichten-Korridor (±{HW})")
+    axes3[0].fill(pr_x, pr_y, color="tomato", alpha=0.30, linewidth=0,
+                  label=f"Schichten↔Gehäuse-Korridor (±{HW})")
     axes3[0].plot(np.append(xs_m, xs_m[0]), np.append(ys_m, ys_m[0]),
                   color="dodgerblue", linewidth=2.0, label="Mandrel-Grenze")
     axes3[0].plot(np.append(xs_r, xs_r[0]), np.append(ys_r, ys_r[0]),
@@ -536,6 +636,8 @@ def main() -> None:
                           det["mandrel_trace"].mean(), alpha=0.25, color="dodgerblue")
     axes4[0].plot(trace_deg, det["mandrel_trace"], color="dodgerblue", linewidth=1.0,
                   label=f"Mandrel  μ={det['mandrel_trace'].mean():.1f}  σ={det['mandrel_trace'].std():.1f}")
+    axes4[0].fill_between(trace_deg, det["mandrel_trace"] - HW, det["mandrel_trace"] + HW,
+                          color="dodgerblue", alpha=0.18, linewidth=0, label=f"±{HW} Korridor")
     axes4[0].axhline(det["mandrel_trace"].mean(), color="dodgerblue",
                      linewidth=1.5, linestyle="--")
     axes4[0].set_xlabel("Winkel θ [°]")
@@ -549,6 +651,8 @@ def main() -> None:
                           det["ring_trace"].mean(), alpha=0.25, color="tomato")
     axes4[1].plot(trace_deg, det["ring_trace"], color="tomato", linewidth=1.0,
                   label=f"Ring  μ={det['ring_trace'].mean():.1f}  σ={det['ring_trace'].std():.1f}")
+    axes4[1].fill_between(trace_deg, det["ring_trace"] - HW, det["ring_trace"] + HW,
+                          color="tomato", alpha=0.18, linewidth=0, label=f"±{HW} Korridor")
     axes4[1].axhline(det["ring_trace"].mean(), color="tomato",
                      linewidth=1.5, linestyle="--")
     axes4[1].set_xlabel("Winkel θ [°]")
