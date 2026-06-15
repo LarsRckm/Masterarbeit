@@ -1,21 +1,23 @@
-"""Region-Weight-Karte aus per-Winkel UEBERGANGS-KORRIDOREN (Faktor 3 / 8).
+"""HYBRID Region-Weight-Karte: Mandrel-Korridor (Kante) + Gehaeuse-BAND (Flaeche).
 
-Idee (kombiniert V6-Philosophie + per-Winkel-Detektion):
+Idee (kombiniert V6-Philosophie + per-Winkel-Detektion + V7-Region fuers Gehaeuse):
   * Detektiere pro Winkel die beiden Uebergaenge (Mandrel<->Schichten,
     Schichten<->Gehaeuse) via detect_regions_per_angle (aus
     test_region_detection.py).
-  * Lege um JEDEN Uebergang einen Korridor von +-HW Zeilen (Default 5).
-  * Gewichte NUR diese Korridore:
-        Mandrel<->Schichten-Korridor : w_mandrel = 3
-        Schichten<->Gehaeuse-Korridor: w_ring    = 8
-        sonst (Mandrel-Kern, Schichten, Gehaeuse-Inneres): w_base = 1
-        Padding                                          : 0
+  * Gewichtung:
+        Mandrel<->Schichten : nur ein +-HW Korridor (Kante)   -> w_mandrel = 3
+        Gehaeuse            : das GANZE Band ab r_ring         -> w_ring    = 8
+        sonst (Mandrel-Kern, Schichten)                       -> w_base    = 1
+        Padding                                               -> 0
+
+Begruendung: Der Mandrel-Uebergang ist eine reine Kante (Kern dahinter homogen)
+-> schmaler Korridor genuegt. Das Gehaeuse muss dagegen ueber die GANZE Schicht
+hell reproduziert werden, nicht nur an der Kante -> ganzes Band ab r_ring.
+half_width gilt damit nur noch fuer den Mandrel-Korridor.
 
 Im Gegensatz zu:
-  * V6 (test_v6_transition.py): radial-symmetrisch (eine Zeile/ein Kreis),
-    Gauss-Boost -> hier per-Winkel, harter +-HW-Korridor.
-  * V7 (dataset_ct_polar): ganze Region konstant gewichtet -> hier nur der
-    schmale Uebergang.
+  * V6 (test_v6_transition.py): radial-symmetrisch, Gauss, beide nur Kante.
+  * V7 (dataset_ct_polar, alt): beide ganze Region (auch Mandrel-Kern).
 
 Usage
 -----
@@ -25,8 +27,8 @@ Usage
 Figures (analog test_v6_transition.py)
 --------------------------------------
 Figure 1 - 1D-Ansicht fuer eine Debug-Spalte: Profil -> Gradient -> Gewichtsprofil
-Figure 2 - Polarbild + Gewichtskarte mit per-Winkel Korridoren
-Figure 3 - Kartesische Rueckprojektion (Original + Korridor-Ringe, Karte, Overlay)
+Figure 2 - Polarbild + Gewichtskarte (Mandrel-Korridor + Gehaeuse-Band)
+Figure 3 - Kartesische Rueckprojektion (Original + Korridor/Band, Karte, Overlay)
 """
 
 from __future__ import annotations
@@ -93,14 +95,19 @@ def compute_region_weights_corridor(
     w_ring: float = 8.0,
     w_base: float = 1.0,
 ) -> np.ndarray:
-    """Gewichtskarte: nur die +-half_width-Korridore um die Uebergaenge geboostet.
+    """Hybrid-Gewichtskarte: Mandrel-Korridor (Kante) + Gehaeuse-BAND (Flaeche).
 
-      |rows - r_mandrel_per_angle[theta]| <= half_width  -> w_mandrel (3)
-      |rows - r_ring_per_angle[theta]|    <= half_width  -> w_ring    (8)
-      sonst (innerhalb der Zelle)                        -> w_base    (1)
+      |rows - r_mandrel_per_angle[theta]| <= half_width  -> w_mandrel (3)  Kante
+      rows >= r_ring_per_angle[theta]   (im Gehaeuse)     -> w_ring    (8)  ganzes Band
+      sonst (Mandrel-Kern, Wicklungen)                   -> w_base    (1)
       Padding (padding_mask == 0)                        -> 0
 
-    Bei Ueberlappung beider Korridore gewinnt der Ring-Korridor (8).
+    Begruendung: Der Mandrel<->Schichten-Uebergang ist eine reine Kante -> nur
+    der schmale Korridor. Das Gehaeuse muss dagegen ueber die GANZE Schicht hell
+    reproduziert werden (nicht nur an der Kante) -> das gesamte Band ab r_ring
+    wird mit w_ring gewichtet (half_width gilt nur noch fuer den Mandrel).
+
+    Bei Ueberlappung gewinnt das Gehaeuse-Band (w_ring).
 
     Returns
     -------
@@ -112,10 +119,10 @@ def compute_region_weights_corridor(
     w = np.full((N_r, N_theta), float(w_base), dtype=np.float32)
 
     d_mandrel = np.abs(rows - r_mandrel_per_angle[np.newaxis, :])
-    d_ring    = np.abs(rows - r_ring_per_angle[np.newaxis, :])
+    is_housing = rows >= r_ring_per_angle[np.newaxis, :]
 
-    w[d_mandrel <= float(half_width)] = float(w_mandrel)
-    w[d_ring    <= float(half_width)] = float(w_ring)     # Ring ueberschreibt bei Ueberlapp
+    w[d_mandrel <= float(half_width)] = float(w_mandrel)   # Mandrel: schmaler Korridor
+    w[is_housing]                     = float(w_ring)      # Gehaeuse: ganzes Band
 
     return (w * padding_mask).astype(np.float32)
 
@@ -190,7 +197,7 @@ def main() -> None:
     n_r = int((region_weights == w_ring).sum())
     n_b = int(((region_weights == w_base) & (padding_mask > 0.5)).sum())
     print(f"Gewichtskarte: Mandrel-Korridor(x{w_mandrel:g})={n_m} px, "
-          f"Gehaeuse-Korridor(x{w_ring:g})={n_r} px, Rest(x{w_base:g})={n_b} px")
+          f"Gehaeuse-Band(x{w_ring:g})={n_r} px, Rest(x{w_base:g})={n_b} px")
 
     # Rueckprojektion -> kartesisch
     weights_cart = polar_to_cart(region_weights, cx, cy, r_max_out, N_r, N_theta, W, pad_value=0.0)
@@ -218,12 +225,12 @@ def main() -> None:
     fig1.suptitle(f"Korridor-Gewichtung - 1D-Pipeline (Debug-Spalte j={jcol}, "
                   f"theta={jcol/N_theta*360:.1f} Grad)", fontsize=13)
 
-    # (A) Intensitaetsprofil + Uebergaenge + Korridore
+    # (A) Intensitaetsprofil + Mandrel-Korridor + Gehaeuse-Band
     axA.plot(rows_col, prof, color="steelblue", linewidth=2.0, label="Intensitaet (geglaettet)")
     axA.axvspan(max(0, r_m_col - HW), min(n_col, r_m_col + HW), color="dodgerblue", alpha=0.30,
                 label=f"Mandrel-Korridor +-{HW}")
-    axA.axvspan(max(0, r_r_col - HW), min(n_col, r_r_col + HW), color="tomato", alpha=0.30,
-                label=f"Gehaeuse-Korridor +-{HW}")
+    axA.axvspan(max(0, r_r_col), n_col, color="tomato", alpha=0.25,
+                label=f"Gehaeuse-Band (x{w_ring:g})")
     axA.axvline(r_m_col, color="dodgerblue", linestyle="--", linewidth=1.5)
     axA.axvline(r_r_col, color="tomato", linestyle="--", linewidth=1.5)
     axA.set_title("Schritt 1: Intensitaetsprofil der Spalte")
@@ -236,7 +243,7 @@ def main() -> None:
     axB.plot(rows_col, grad, color="darkorange", linewidth=1.5, label="dI/dr")
     axB.axhline(0.0, color="black", linewidth=0.6)
     axB.axvspan(max(0, r_m_col - HW), min(n_col, r_m_col + HW), color="dodgerblue", alpha=0.30)
-    axB.axvspan(max(0, r_r_col - HW), min(n_col, r_r_col + HW), color="tomato", alpha=0.30)
+    axB.axvspan(max(0, r_r_col), n_col, color="tomato", alpha=0.25)
     axB.axvline(r_m_col, color="dodgerblue", linestyle="--", linewidth=1.5,
                 label=f"Mandrel-Uebergang (Zeile {r_m_col:.0f})")
     axB.axvline(r_r_col, color="tomato", linestyle="--", linewidth=1.5,
@@ -253,8 +260,8 @@ def main() -> None:
     axC.axvline(r_m_col, color="dodgerblue", linestyle="--", linewidth=1.2,
                 label=f"Mandrel-Korridor (x{w_mandrel:g})")
     axC.axvline(r_r_col, color="tomato", linestyle="--", linewidth=1.2,
-                label=f"Gehaeuse-Korridor (x{w_ring:g})")
-    axC.set_title("Schritt 3: Gewichtsprofil = Boxcar-Boost nur im Korridor")
+                label=f"Gehaeuse-Band ab hier (x{w_ring:g})")
+    axC.set_title("Schritt 3: Gewichtsprofil = Mandrel-Korridor (3) + Gehaeuse-Band (8)")
     axC.set_xlabel("Zeilen-Index (Radius r)")
     axC.set_ylabel("Gewicht")
     axC.set_ylim(-0.3, vmax + 0.5)
@@ -266,17 +273,17 @@ def main() -> None:
     # Figure 2 - Polarbild + Gewichtskarte
     # -------------------------------------------------------------------------
     fig2, (axP, axW) = plt.subplots(1, 2, figsize=(18, 7))
-    fig2.suptitle("Korridor-Gewichtskarte im Polarraum (per-Winkel Uebergaenge +-5)", fontsize=13)
+    fig2.suptitle("Hybrid-Gewichtskarte im Polarraum (Mandrel-Korridor + Gehaeuse-Band)", fontsize=13)
 
     axP.imshow(polar_u8, cmap="gray", vmin=0, vmax=255, aspect="auto", extent=ext)
     axP.fill_between(theta_deg, r_mandrel_per_angle - HW, r_mandrel_per_angle + HW,
                      color="dodgerblue", alpha=0.30, linewidth=0, label=f"Mandrel-Korridor +-{HW}")
-    axP.fill_between(theta_deg, r_ring_per_angle - HW, r_ring_per_angle + HW,
-                     color="tomato", alpha=0.30, linewidth=0, label=f"Gehaeuse-Korridor +-{HW}")
+    axP.fill_between(theta_deg, r_ring_per_angle, r_valid_rows,
+                     color="tomato", alpha=0.25, linewidth=0, label=f"Gehaeuse-Band (x{w_ring:g})")
     axP.plot(theta_deg, r_mandrel_per_angle, color="dodgerblue", linewidth=1.5)
-    axP.plot(theta_deg, r_ring_per_angle, color="tomato", linewidth=1.5)
+    axP.plot(theta_deg, r_ring_per_angle, color="tomato", linewidth=1.5, label="Schichten<->Gehaeuse")
     axP.plot(theta_deg, r_valid_rows, color="lime", linewidth=1.0, linestyle="--", label="Zellgrenze")
-    axP.set_title("Polarbild + Korridore")
+    axP.set_title("Polarbild + Mandrel-Korridor + Gehaeuse-Band")
     axP.set_xlabel("Winkel theta [Grad]")
     axP.set_ylabel("Radius r [Zeilen-Index]")
     axP.legend(fontsize=8)
@@ -284,7 +291,7 @@ def main() -> None:
     imW = axW.imshow(region_weights, cmap="inferno", vmin=0, vmax=vmax, aspect="auto", extent=ext)
     axW.plot(theta_deg, r_mandrel_per_angle, color="dodgerblue", linewidth=0.8, linestyle="--")
     axW.plot(theta_deg, r_ring_per_angle, color="cyan", linewidth=0.8, linestyle="--")
-    axW.set_title(f"Gewichtskarte (Korridor x{w_mandrel:g} / x{w_ring:g}, Rest x{w_base:g}, Padding 0)")
+    axW.set_title(f"Gewichtskarte (Mandrel-Korridor x{w_mandrel:g} / Gehaeuse-Band x{w_ring:g}, Rest x{w_base:g})")
     axW.set_xlabel("Winkel theta [Grad]")
     axW.set_ylabel("Radius r [Zeilen-Index]")
     plt.colorbar(imW, ax=axW, fraction=0.03, pad=0.02, label="weight")
@@ -310,9 +317,9 @@ def main() -> None:
 
     axO.imshow(gray, cmap="gray", vmin=0, vmax=255)
     pmx, pmy = _annulus_poly(r_mandrel_per_angle - HW, r_mandrel_per_angle + HW)
-    prx, pry = _annulus_poly(r_ring_per_angle - HW, r_ring_per_angle + HW)
+    prx, pry = _annulus_poly(r_ring_per_angle, r_valid_rows)   # ganzes Gehaeuse-Band
     axO.fill(pmx, pmy, color="dodgerblue", alpha=0.30, linewidth=0, label=f"Mandrel-Korridor (+-{HW})")
-    axO.fill(prx, pry, color="tomato", alpha=0.30, linewidth=0, label=f"Gehaeuse-Korridor (+-{HW})")
+    axO.fill(prx, pry, color="tomato", alpha=0.25, linewidth=0, label=f"Gehaeuse-Band (x{w_ring:g})")
     xs_m, ys_m = _polar_curve_to_cart(r_mandrel_per_angle)
     xs_r, ys_r = _polar_curve_to_cart(r_ring_per_angle)
     axO.plot(np.append(xs_m, xs_m[0]), np.append(ys_m, ys_m[0]), color="dodgerblue", linewidth=1.5)
@@ -322,7 +329,7 @@ def main() -> None:
         by = np.append(edge_pts_xy[:, 1], edge_pts_xy[0, 1])
         axO.plot(bx, by, color="lime", linewidth=1.2, linestyle="--", label="Zellgrenze")
     axO.legend(fontsize=8, loc="lower right")
-    axO.set_title(f"Original ({W}x{H}) + Korridor-Ringe")
+    axO.set_title(f"Original ({W}x{H}) + Mandrel-Korridor + Gehaeuse-Band")
     axO.axis("off")
 
     imWC = axWC.imshow(weights_cart, cmap="inferno", vmin=0, vmax=vmax)

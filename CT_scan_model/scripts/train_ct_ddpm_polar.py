@@ -219,9 +219,14 @@ def main(argv: Optional[list] = None) -> int:
                         "for the qualitative samples.")
     p.add_argument("--p-uncond", type=float, default=0.1)
 
+    p.add_argument("--w-mandrel", type=float, default=3.0,
+                   help="Loss weight for the Mandrel<->layers transition corridor (±5 rows).")
+    p.add_argument("--w-ring", type=float, default=50.0,
+                   help="Loss weight for the whole cell-housing/can band (rows >= r_ring).")
+
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--run-dir", default=None)
-    p.add_argument("--save-every", type=int, default=20)
+    p.add_argument("--save-every", type=int, default=0)
     p.add_argument("--tqdm", action="store_true", default=True)
 
     p.add_argument("--early-stopping-patience", type=int, default=0,
@@ -234,7 +239,7 @@ def main(argv: Optional[list] = None) -> int:
                    help="Explicit checkpoint path to resume from (overrides default search)")
 
     p.add_argument("--sample-every", type=int, default=10)
-    p.add_argument("--sample-n", type=int, default=3)
+    p.add_argument("--sample-n", type=int, default=1)
     p.add_argument("--sample-cfg-scale", type=float, default=1.0)
     p.add_argument("--sample-sampler", choices=["ddpm", "ddim"], default="ddpm",
                    help="Sampler used for qualitative samples during training")
@@ -300,6 +305,7 @@ def main(argv: Optional[list] = None) -> int:
             args.index, args.geometry,
             splits_json=args.splits, split="train",
             max_pictures=max_pics_rounded, seed=int(args.seed),
+            w_mandrel=float(args.w_mandrel), w_ring=float(args.w_ring),
         )
         print(
             f"Picture-budget mode: max_pictures={args.max_pictures} -> rounded={max_pics_rounded} "
@@ -310,6 +316,7 @@ def main(argv: Optional[list] = None) -> int:
             args.index, args.geometry,
             splits_json=args.splits, split="train",
             batch_size=int(args.batch_size), seed=int(args.seed), pad_to_batch=True,
+            w_mandrel=float(args.w_mandrel), w_ring=float(args.w_ring),
         )
 
     def _select_mid_slice_per_format(split_name: str) -> list:
@@ -348,8 +355,14 @@ def main(argv: Optional[list] = None) -> int:
     if not test_samples:
         raise RuntimeError("No test samples found.")
 
-    val_ds = BatteryCTPolarSelectedSamplesDataset(args.index, args.geometry, samples=val_samples)
-    test_ds = BatteryCTPolarSelectedSamplesDataset(args.index, args.geometry, samples=test_samples)
+    val_ds = BatteryCTPolarSelectedSamplesDataset(
+        args.index, args.geometry, samples=val_samples,
+        w_mandrel=float(args.w_mandrel), w_ring=float(args.w_ring),
+    )
+    test_ds = BatteryCTPolarSelectedSamplesDataset(
+        args.index, args.geometry, samples=test_samples,
+        w_mandrel=float(args.w_mandrel), w_ring=float(args.w_ring),
+    )
 
     if int(args.max_pictures) <= 0 and int(args.epochs) <= 0:
         args.epochs = int(args.slices_per_cell)
@@ -400,30 +413,16 @@ def main(argv: Optional[list] = None) -> int:
     best_val = float("inf")
     start_epoch = 1
     epochs_no_improve = 0
-    prev_recent_path = None   # rolling --save-every 0 checkpoint (checkpoint_{epoch}.pt)
 
     # --- Resume from checkpoint ---
     if bool(args.resume) or args.resume_from is not None:
         if args.resume_from is not None:
             ckpt_path = args.resume_from
         else:
-            # Priority: rolling checkpoint_{epoch}.pt with the highest epoch
-            #           (save-every=0) → checkpoint_best.pt → latest epoch checkpoint
-            import glob as _glob
-            import re as _re
-            most_recent = None
-            best_ep = -1
-            for c in _glob.glob(os.path.join(run_dir, "checkpoint_*.pt")):
-                m = _re.match(r"checkpoint_(\d+)\.pt$", os.path.basename(c))
-                if m and int(m.group(1)) > best_ep:
-                    best_ep = int(m.group(1))
-                    most_recent = c
-            best_ckpt = os.path.join(run_dir, "checkpoint_best.pt")
-            if most_recent is not None:
-                ckpt_path = most_recent
-            elif os.path.isfile(best_ckpt):
-                ckpt_path = best_ckpt
-            else:
+            # Priority: checkpoint_best.pt → latest epoch checkpoint
+            ckpt_path = os.path.join(run_dir, "checkpoint_best.pt")
+            if not os.path.isfile(ckpt_path):
+                import glob as _glob
                 epoch_ckpts = sorted(
                     _glob.glob(os.path.join(weights_dir, "checkpoint_epoch_*.pt"))
                 )
@@ -653,30 +652,16 @@ def main(argv: Optional[list] = None) -> int:
                 header=["epoch", "train_loss", "val_loss", "best_val"],
                 row=[epoch, float(train_loss), float(val_loss), float(best_val)],
             )
-            ckpt_state = {
-                "epoch": epoch,
-                "model": model.state_dict(),
-                "ema_model": ema_model.state_dict(),
-                "optimizer": optimizer.state_dict(),
-                "best_val": best_val,
-                "epochs_no_improve": epochs_no_improve,
-                "N_r": N_r, "N_theta": N_theta,
-            }
             if int(args.save_every) > 0 and (epoch % int(args.save_every) == 0):
-                torch.save(ckpt_state, os.path.join(weights_dir, f"checkpoint_epoch_{epoch:04d}.pt"))
-            elif int(args.save_every) == 0:
-                # --save-every 0: keep a single rolling checkpoint named by epoch
-                # (so the epoch is readable from the filename), parallel to
-                # checkpoint_best.pt. Save the new one first, then remove the
-                # previous epoch's file so only the latest remains.
-                recent_path = os.path.join(run_dir, f"checkpoint_{epoch}.pt")
-                torch.save(ckpt_state, recent_path)
-                if prev_recent_path is not None and prev_recent_path != recent_path:
-                    try:
-                        os.remove(prev_recent_path)
-                    except OSError:
-                        pass
-                prev_recent_path = recent_path
+                torch.save({
+                    "epoch": epoch,
+                    "model": model.state_dict(),
+                    "ema_model": ema_model.state_dict(),
+                    "optimizer": optimizer.state_dict(),
+                    "best_val": best_val,
+                    "epochs_no_improve": epochs_no_improve,
+                    "N_r": N_r, "N_theta": N_theta,
+                }, os.path.join(weights_dir, f"checkpoint_epoch_{epoch:04d}.pt"))
 
             if int(args.early_stopping_patience) > 0 and epochs_no_improve >= int(args.early_stopping_patience):
                 print(f"Early stopping: val_loss did not improve for {epochs_no_improve} epochs "

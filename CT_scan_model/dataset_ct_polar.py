@@ -108,24 +108,26 @@ def _compute_region_weights(
     w_ring: float = 8.0,
     w_base: float = 1.0,
 ) -> np.ndarray:
-    """Per-pixel loss weight map boosting only the per-angle TRANSITION corridors.
+    """Hybrid per-pixel loss weight map: Mandrel CORRIDOR (edge) + Can BAND (area).
 
     Both transition curves (Mandrel/Layer and Layer/Can) are detected per angle
     via ``detect_regions_per_angle`` (column-gradient based, mirrors
     ``detect_cell_boundary``'s per-angle approach), since neither transition is
     a perfect circle in general.
 
-    Unlike the blockwise-constant variant (which up-weighted the entire region),
-    here only a narrow corridor of ±half_width rows around each transition curve
-    is boosted — this concentrates the loss on the sharp edges (V6 philosophy)
-    instead of starving the high-frequency winding region:
+    The two regions are treated differently on purpose:
 
-      |rows - r_mandrel_per_angle[theta]| <= half_width  -> w_mandrel (edge)
-      |rows - r_ring_per_angle[theta]|    <= half_width  -> w_ring    (edge)
-      else (inside the cell)                             -> w_base
+      |rows - r_mandrel_per_angle[theta]| <= half_width  -> w_mandrel  (narrow edge)
+      rows >= r_ring_per_angle[theta]   (inside the cell) -> w_ring    (whole can band)
+      else (mandrel core, winding layers)                -> w_base
       outside the cell (padding_mask == 0)               -> 0
 
-    On overlap the Ring/Can corridor wins (w_ring).
+    Rationale: the Mandrel/Layer transition is a pure edge (the mandrel core
+    behind it is homogeneous), so a narrow ±half_width corridor suffices. The
+    can/housing, by contrast, must be reproduced bright across its *whole* width
+    (not just at the edge), so the entire band from r_ring out to the cell
+    boundary is up-weighted. ``half_width`` therefore only applies to the Mandrel
+    corridor. On overlap the can band wins (w_ring).
 
     Returns
     -------
@@ -139,11 +141,11 @@ def _compute_region_weights(
 
     w = np.full((N_r, N_theta), float(w_base), dtype=np.float32)
 
-    d_mandrel = np.abs(rows - r_mandrel_per_angle[np.newaxis, :])
-    d_ring    = np.abs(rows - r_ring_per_angle[np.newaxis, :])
+    d_mandrel  = np.abs(rows - r_mandrel_per_angle[np.newaxis, :])
+    is_housing = rows >= r_ring_per_angle[np.newaxis, :]
 
-    w[d_mandrel <= float(half_width)] = float(w_mandrel)
-    w[d_ring    <= float(half_width)] = float(w_ring)   # Ring overrides on overlap
+    w[d_mandrel <= float(half_width)] = float(w_mandrel)   # Mandrel: narrow corridor
+    w[is_housing]                     = float(w_ring)      # Can: whole band
 
     return (w * padding_mask).astype(np.float32)
 
@@ -156,6 +158,8 @@ def _build_sample_tensor(
     N_r: int,
     N_theta: int,
     pad_value: float,
+    w_mandrel: float = 3.0,
+    w_ring: float = 8.0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, float]:
     """Convert an original-resolution greyscale image to a polar tensor.
 
@@ -187,6 +191,7 @@ def _build_sample_tensor(
     r_scale = r_max / max(1.0, float(N_r - 1))
     region_weights = _compute_region_weights(
         polar_img, padding_mask, r_valid_per_angle, r_scale, N_r, N_theta,
+        w_mandrel=w_mandrel, w_ring=w_ring,
     )
 
     polar_t   = torch.from_numpy(polar_img).to(dtype=torch.float32)
@@ -255,6 +260,8 @@ class BatteryCTPolarPerCellDataset(Dataset):
         batch_size: int,
         seed: int = 42,
         pad_to_batch: bool = True,
+        w_mandrel: float = 3.0,
+        w_ring: float = 8.0,
     ) -> None:
         if split not in {"train", "val", "test"}:
             raise ValueError("split must be one of: train/val/test")
@@ -270,6 +277,8 @@ class BatteryCTPolarPerCellDataset(Dataset):
         self.N_r = int(getattr(project_config, "POLAR_N_R", 512))
         self.N_theta = int(getattr(project_config, "POLAR_N_THETA", 1024))
         self.pad_value = float(getattr(project_config, "POLAR_PAD_VALUE", -2.0))
+        self.w_mandrel = float(w_mandrel)
+        self.w_ring = float(w_ring)
         self.seed = int(seed)
         self._epoch = 1
 
@@ -323,6 +332,7 @@ class BatteryCTPolarPerCellDataset(Dataset):
         x, mask_t, weights_t, r_max = _build_sample_tensor(
             gray, cx, cy, r_valid_per_angle,
             self.N_r, self.N_theta, self.pad_value,
+            self.w_mandrel, self.w_ring,
         )
         cat, cont = _build_conditioning(g, r_max, image_half_size, slice_depth_relative)
         return x, (cat, cont), mask_t, weights_t
@@ -334,7 +344,8 @@ class BatteryCTPolarSelectedSamplesDataset(Dataset):
     Mirrors BatteryCTSelectedSamplesDataset.
     """
 
-    def __init__(self, index_json: str, geometry_json: str, samples: List[dict]) -> None:
+    def __init__(self, index_json: str, geometry_json: str, samples: List[dict],
+                 w_mandrel: float = 3.0, w_ring: float = 8.0) -> None:
         with open(index_json, "r", encoding="utf-8") as f:
             self.index = json.load(f)
         with open(geometry_json, "r", encoding="utf-8") as f:
@@ -344,6 +355,8 @@ class BatteryCTPolarSelectedSamplesDataset(Dataset):
         self.N_r = int(getattr(project_config, "POLAR_N_R", 512))
         self.N_theta = int(getattr(project_config, "POLAR_N_THETA", 1024))
         self.pad_value = float(getattr(project_config, "POLAR_PAD_VALUE", -2.0))
+        self.w_mandrel = float(w_mandrel)
+        self.w_ring = float(w_ring)
 
         self.samples = list(samples)
         if not self.samples:
@@ -368,6 +381,7 @@ class BatteryCTPolarSelectedSamplesDataset(Dataset):
         x, mask_t, weights_t, r_max = _build_sample_tensor(
             gray, cx, cy, r_valid_per_angle,
             self.N_r, self.N_theta, self.pad_value,
+            self.w_mandrel, self.w_ring,
         )
         cat, cont = _build_conditioning(g, r_max, image_half_size, slice_depth_relative)
         return x, (cat, cont), mask_t, weights_t
@@ -387,6 +401,8 @@ class BatteryCTPolarUniformCellsMaxPicturesDataset(Dataset):
         split: str,
         max_pictures: int,
         seed: int = 42,
+        w_mandrel: float = 3.0,
+        w_ring: float = 8.0,
     ) -> None:
         if split not in {"train", "val", "test"}:
             raise ValueError("split must be one of: train/val/test")
@@ -403,6 +419,8 @@ class BatteryCTPolarUniformCellsMaxPicturesDataset(Dataset):
         self.base_path = self.index["base_path"]
         self.N_r = int(getattr(project_config, "POLAR_N_R", 512))
         self.N_theta = int(getattr(project_config, "POLAR_N_THETA", 1024))
+        self.w_mandrel = float(w_mandrel)
+        self.w_ring = float(w_ring)
         self.pad_value = float(getattr(project_config, "POLAR_PAD_VALUE", -2.0))
         self.seed = int(seed)
         self.max_pictures = int(max_pictures)
@@ -465,6 +483,7 @@ class BatteryCTPolarUniformCellsMaxPicturesDataset(Dataset):
         x, mask_t, weights_t, r_max = _build_sample_tensor(
             gray, cx, cy, r_valid_per_angle,
             self.N_r, self.N_theta, self.pad_value,
+            self.w_mandrel, self.w_ring,
         )
         cat, cont = _build_conditioning(g, r_max, image_half_size, slice_depth_relative)
         return x, (cat, cont), mask_t, weights_t
