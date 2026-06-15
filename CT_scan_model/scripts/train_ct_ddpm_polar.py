@@ -400,16 +400,30 @@ def main(argv: Optional[list] = None) -> int:
     best_val = float("inf")
     start_epoch = 1
     epochs_no_improve = 0
+    prev_recent_path = None   # rolling --save-every 0 checkpoint (checkpoint_{epoch}.pt)
 
     # --- Resume from checkpoint ---
     if bool(args.resume) or args.resume_from is not None:
         if args.resume_from is not None:
             ckpt_path = args.resume_from
         else:
-            # Priority: checkpoint_best.pt → latest epoch checkpoint
-            ckpt_path = os.path.join(run_dir, "checkpoint_best.pt")
-            if not os.path.isfile(ckpt_path):
-                import glob as _glob
+            # Priority: rolling checkpoint_{epoch}.pt with the highest epoch
+            #           (save-every=0) → checkpoint_best.pt → latest epoch checkpoint
+            import glob as _glob
+            import re as _re
+            most_recent = None
+            best_ep = -1
+            for c in _glob.glob(os.path.join(run_dir, "checkpoint_*.pt")):
+                m = _re.match(r"checkpoint_(\d+)\.pt$", os.path.basename(c))
+                if m and int(m.group(1)) > best_ep:
+                    best_ep = int(m.group(1))
+                    most_recent = c
+            best_ckpt = os.path.join(run_dir, "checkpoint_best.pt")
+            if most_recent is not None:
+                ckpt_path = most_recent
+            elif os.path.isfile(best_ckpt):
+                ckpt_path = best_ckpt
+            else:
                 epoch_ckpts = sorted(
                     _glob.glob(os.path.join(weights_dir, "checkpoint_epoch_*.pt"))
                 )
@@ -639,16 +653,30 @@ def main(argv: Optional[list] = None) -> int:
                 header=["epoch", "train_loss", "val_loss", "best_val"],
                 row=[epoch, float(train_loss), float(val_loss), float(best_val)],
             )
+            ckpt_state = {
+                "epoch": epoch,
+                "model": model.state_dict(),
+                "ema_model": ema_model.state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "best_val": best_val,
+                "epochs_no_improve": epochs_no_improve,
+                "N_r": N_r, "N_theta": N_theta,
+            }
             if int(args.save_every) > 0 and (epoch % int(args.save_every) == 0):
-                torch.save({
-                    "epoch": epoch,
-                    "model": model.state_dict(),
-                    "ema_model": ema_model.state_dict(),
-                    "optimizer": optimizer.state_dict(),
-                    "best_val": best_val,
-                    "epochs_no_improve": epochs_no_improve,
-                    "N_r": N_r, "N_theta": N_theta,
-                }, os.path.join(weights_dir, f"checkpoint_epoch_{epoch:04d}.pt"))
+                torch.save(ckpt_state, os.path.join(weights_dir, f"checkpoint_epoch_{epoch:04d}.pt"))
+            elif int(args.save_every) == 0:
+                # --save-every 0: keep a single rolling checkpoint named by epoch
+                # (so the epoch is readable from the filename), parallel to
+                # checkpoint_best.pt. Save the new one first, then remove the
+                # previous epoch's file so only the latest remains.
+                recent_path = os.path.join(run_dir, f"checkpoint_{epoch}.pt")
+                torch.save(ckpt_state, recent_path)
+                if prev_recent_path is not None and prev_recent_path != recent_path:
+                    try:
+                        os.remove(prev_recent_path)
+                    except OSError:
+                        pass
+                prev_recent_path = recent_path
 
             if int(args.early_stopping_patience) > 0 and epochs_no_improve >= int(args.early_stopping_patience):
                 print(f"Early stopping: val_loss did not improve for {epochs_no_improve} epochs "
