@@ -59,6 +59,7 @@ from CT_scan_model.polar_transform import (
     detect_cell_boundary,
     cart_to_polar_boundary,
     polar_to_cart,
+    detect_regions_per_angle as _detect_regions_core,
 )
 
 
@@ -112,122 +113,31 @@ def detect_regions_per_angle(
     mandrel_search_frac: float = 0.50,
     min_peak_rel_height: float = 0.10,
 ) -> dict:
-    """Erkennt Mandrel- und Ring-Grenze pro Winkel über Spalten-Gradienten.
+    """Dünner Wrapper um die TRAININGS-Detektion (einzige Quelle der Wahrheit).
 
-    Vorgehen (analog detect_cell_boundary):
-    1. Für jeden der n_trace_angles Winkel die zugehörige Polarspalte auslesen
-    2. Intensitätsprofil der Spalte glätten und Gradient berechnen
-    3. Ring-Grenze:    größtes positives Peak im letzten ring_search_frac
-                       des validen Spaltenbereichs
-    4. Mandrel-Grenze: erstes signifikantes Peak im ersten mandrel_search_frac
-    5. 720 Punkte → N_theta Bins interpolieren (periodisch, wie detect_cell_boundary)
+    Delegiert an ``CT_scan_model.polar_transform.detect_regions_per_angle`` mit
+    ``return_debug=True``. Damit ist die hier visualisierte Regionen-Einteilung
+    exakt dieselbe, die das Training (``dataset_ct_polar._compute_region_labels``)
+    verwendet — ändert man die Detektion, muss man nur noch *eine* Funktion
+    anfassen.
 
     Returns
     -------
     dict mit:
-      r_mandrel_per_angle : float32 [N_theta]
-      r_ring_per_angle    : float32 [N_theta]
-      trace_angles_rad    : float64 [n_trace_angles]  für Debug-Plots
-      mandrel_trace       : float32 [n_trace_angles]  Rohwerte vor Interpolation
-      ring_trace          : float32 [n_trace_angles]
-      debug_col           : int     Beispiel-Spalte für Figure 2
-      debug_profile       : float64 Intensitätsprofil der debug_col
-      debug_gradient      : float64 Gradient der debug_col
-      debug_r_mandrel     : int
-      debug_r_ring        : int
+      r_mandrel_per_angle, r_ring_per_angle : float32 [N_theta]
+      trace_angles_rad, mandrel_trace, ring_trace : Rohwerte (für Figure 4)
+      debug_col, debug_profile, debug_gradient, debug_r_mandrel, debug_r_ring
+                                            : Beispiel-Spalte (für Figure 1/2)
     """
-    N_r, N_theta = polar_img.shape
-
-    trace_angles_rad = np.linspace(0.0, 2.0 * math.pi, n_trace_angles, endpoint=False)
-    # Abbildung Winkel → Spalten-Index
-    trace_cols = (trace_angles_rad / (2.0 * math.pi) * N_theta).astype(int) % N_theta
-
-    mandrel_trace = np.zeros(n_trace_angles, dtype=np.float32)
-    ring_trace    = np.zeros(n_trace_angles, dtype=np.float32)
-
-    debug_col      = trace_cols[n_trace_angles // 4]   # 90° als Beispiel
-    debug_profile  = None
-    debug_gradient = None
-    debug_r_m      = 0
-    debug_r_r      = 0
-
-    for k, j in enumerate(trace_cols):
-        # Valide Zeilen für diese Spalte
-        r_valid_j   = float(r_valid_per_angle[j])
-        r_valid_idx = min(N_r - 1, max(1, int(round(r_valid_j / r_scale))))
-
-        # Spaltenprofil bis zur validen Grenze
-        profile = polar_img[:r_valid_idx, j].astype(np.float64)
-        n = len(profile)
-        if n < 10:
-            ring_trace[k]    = float(r_valid_idx - 1)
-            mandrel_trace[k] = 0.0
-            continue
-
-        profile_smooth = _smooth(profile, sigma=smooth_sigma)
-        grad           = np.gradient(profile_smooth)
-
-        # --- Ring-Grenze: letztes signifikantes Peak im letzten ring_search_frac ---
-        ring_start = max(1, int(n * (1.0 - ring_search_frac)))
-        threshold  = float(np.max(np.abs(grad))) * min_peak_rel_height
-        found = False
-        for i in range(n - 2, ring_start - 1, -1):
-            if (grad[i] > grad[i - 1] and
-                    grad[i] > grad[i + 1] and
-                    grad[i] > threshold):
-                ring_trace[k] = float(i)
-                found = True
-                break
-        if not found:
-            ring_local = grad[ring_start:]
-            ring_trace[k] = float(ring_start + int(np.argmax(ring_local)))
-
-        # --- Mandrel-Grenze: erstes signifikantes Peak im ersten mandrel_search_frac ---
-        mandrel_end  = max(2, int(n * mandrel_search_frac))
-        mand_region  = grad[:mandrel_end]
-        threshold    = float(np.max(np.abs(grad))) * min_peak_rel_height
-
-        # suche das erste lokale Maximum über dem Schwellwert
-        found = False
-        for i in range(1, mandrel_end - 1):
-            if (mand_region[i] > mand_region[i - 1] and
-                    mand_region[i] > mand_region[i + 1] and
-                    mand_region[i] > threshold):
-                mandrel_trace[k] = float(i)
-                found = True
-                break
-        if not found:
-            mandrel_trace[k] = float(int(np.argmax(mand_region)))
-
-        # Debug-Spalte speichern
-        if j == debug_col:
-            debug_profile  = profile_smooth
-            debug_gradient = grad
-            debug_r_m      = int(mandrel_trace[k])
-            debug_r_r      = int(ring_trace[k])
-
-    # --- Interpolation auf N_theta Bins (periodisch) ---
-    theta_out    = np.linspace(0.0, 2.0 * math.pi, N_theta, endpoint=False)
-    angles_wrap  = np.append(trace_angles_rad, trace_angles_rad[0] + 2.0 * math.pi)
-
-    m_wrap = np.append(mandrel_trace, mandrel_trace[0])
-    r_wrap = np.append(ring_trace,    ring_trace[0])
-
-    r_mandrel_per_angle = np.interp(theta_out, angles_wrap, m_wrap).astype(np.float32)
-    r_ring_per_angle    = np.interp(theta_out, angles_wrap, r_wrap).astype(np.float32)
-
-    return {
-        "r_mandrel_per_angle": r_mandrel_per_angle,
-        "r_ring_per_angle":    r_ring_per_angle,
-        "trace_angles_rad":    trace_angles_rad,
-        "mandrel_trace":       mandrel_trace,
-        "ring_trace":          ring_trace,
-        "debug_col":           int(debug_col),
-        "debug_profile":       debug_profile if debug_profile is not None else np.zeros(10),
-        "debug_gradient":      debug_gradient if debug_gradient is not None else np.zeros(10),
-        "debug_r_mandrel":     debug_r_m,
-        "debug_r_ring":        debug_r_r,
-    }
+    return _detect_regions_core(
+        polar_img, padding_mask, r_valid_per_angle, r_scale,
+        n_trace_angles=n_trace_angles,
+        smooth_sigma=smooth_sigma,
+        ring_search_frac=ring_search_frac,
+        mandrel_search_frac=mandrel_search_frac,
+        min_peak_rel_height=min_peak_rel_height,
+        return_debug=True,
+    )
 
 
 def build_three_class_mask(

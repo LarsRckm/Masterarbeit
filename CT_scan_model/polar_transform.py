@@ -314,13 +314,14 @@ def detect_regions_per_angle(
     ring_search_frac: float = 0.12,
     mandrel_search_frac: float = 0.50,
     min_peak_rel_height: float = 0.10,
-) -> Tuple[np.ndarray, np.ndarray]:
+    return_debug: bool = False,
+):
     """Detect Mandrel- and Ring(Can)-boundary per angle from column gradients.
 
     For each of ``n_trace_angles`` angles, the corresponding polar column is
     read out, smoothed, and its radial gradient analysed:
 
-    - Ring boundary    : strongest positive gradient peak in the last
+    - Ring boundary    : last (outermost) significant gradient peak in the last
                          ``ring_search_frac`` of the valid column range
                          (the bright, high-absorption can wall).
     - Mandrel boundary : first significant gradient peak in the first
@@ -330,10 +331,18 @@ def detect_regions_per_angle(
     The ``n_trace_angles`` raw values are then interpolated to ``N_theta``
     bins (periodic), mirroring ``detect_cell_boundary``.
 
+    This is the single source of truth used BOTH by training
+    (``dataset_ct_polar._compute_region_labels``) and by the visualisation
+    scripts (``test_region_detection`` re-exports this with ``return_debug=True``).
+
     Returns
     -------
-    r_mandrel_per_angle : float32 [N_theta] — Mandrel/Layer boundary row index
-    r_ring_per_angle    : float32 [N_theta] — Layer/Can boundary row index
+    If ``return_debug`` is False (default, used by training):
+        (r_mandrel_per_angle, r_ring_per_angle) : float32 [N_theta] each.
+    If ``return_debug`` is True (used by the test scripts):
+        a dict additionally containing the raw traces and one example column
+        (trace_angles_rad, mandrel_trace, ring_trace, debug_col, debug_profile,
+         debug_gradient, debug_r_mandrel, debug_r_ring) for plotting.
     """
     N_r, N_theta = polar_img.shape
 
@@ -342,6 +351,13 @@ def detect_regions_per_angle(
 
     mandrel_trace = np.zeros(n_trace_angles, dtype=np.float32)
     ring_trace    = np.zeros(n_trace_angles, dtype=np.float32)
+
+    # Debug capture for one example column (90°), only used when return_debug=True.
+    debug_col      = int(trace_cols[n_trace_angles // 4])
+    debug_profile  = None
+    debug_gradient = None
+    debug_r_m      = 0
+    debug_r_r      = 0
 
     for k, j in enumerate(trace_cols):
         r_valid_j   = float(r_valid_per_angle[j])
@@ -357,10 +373,23 @@ def detect_regions_per_angle(
         profile_smooth = _smooth_profile(profile, sigma=smooth_sigma)
         grad           = np.gradient(profile_smooth)
 
-        # --- Ring boundary: strongest positive peak in the last ring_search_frac ---
-        ring_start = max(0, int(n * (1.0 - ring_search_frac)))
-        ring_local = grad[ring_start:]
-        ring_trace[k] = float(ring_start + int(np.argmax(ring_local)))
+        # --- Ring boundary: LAST significant local peak in the last ring_search_frac ---
+        # (matches test_region_detection.detect_regions_per_angle: search backwards
+        #  from the outermost row for the first local maximum above threshold, so the
+        #  detected can edge equals what test_corridor_weights.py visualises.)
+        ring_start = max(1, int(n * (1.0 - ring_search_frac)))
+        threshold  = float(np.max(np.abs(grad))) * min_peak_rel_height
+        found = False
+        for i in range(n - 2, ring_start - 1, -1):
+            if (grad[i] > grad[i - 1] and
+                    grad[i] > grad[i + 1] and
+                    grad[i] > threshold):
+                ring_trace[k] = float(i)
+                found = True
+                break
+        if not found:
+            ring_local = grad[ring_start:]
+            ring_trace[k] = float(ring_start + int(np.argmax(ring_local)))
 
         # --- Mandrel boundary: first significant peak in the first mandrel_search_frac ---
         mandrel_end = max(2, int(n * mandrel_search_frac))
@@ -378,6 +407,13 @@ def detect_regions_per_angle(
         if not found:
             mandrel_trace[k] = float(int(np.argmax(mand_region)))
 
+        # Capture the example column for the debug plots.
+        if j == debug_col:
+            debug_profile  = profile_smooth
+            debug_gradient = grad
+            debug_r_m      = int(mandrel_trace[k])
+            debug_r_r      = int(ring_trace[k])
+
     # --- Interpolate to N_theta bins (periodic) ---
     theta_out   = np.linspace(0.0, 2.0 * math.pi, N_theta, endpoint=False)
     angles_wrap = np.append(trace_angles_rad, trace_angles_rad[0] + 2.0 * math.pi)
@@ -388,4 +424,18 @@ def detect_regions_per_angle(
     r_mandrel_per_angle = np.interp(theta_out, angles_wrap, m_wrap).astype(np.float32)
     r_ring_per_angle    = np.interp(theta_out, angles_wrap, r_wrap).astype(np.float32)
 
-    return r_mandrel_per_angle, r_ring_per_angle
+    if not return_debug:
+        return r_mandrel_per_angle, r_ring_per_angle
+
+    return {
+        "r_mandrel_per_angle": r_mandrel_per_angle,
+        "r_ring_per_angle":    r_ring_per_angle,
+        "trace_angles_rad":    trace_angles_rad,
+        "mandrel_trace":       mandrel_trace,
+        "ring_trace":          ring_trace,
+        "debug_col":           int(debug_col),
+        "debug_profile":       debug_profile if debug_profile is not None else np.zeros(10),
+        "debug_gradient":      debug_gradient if debug_gradient is not None else np.zeros(10),
+        "debug_r_mandrel":     int(debug_r_m),
+        "debug_r_ring":        int(debug_r_r),
+    }
