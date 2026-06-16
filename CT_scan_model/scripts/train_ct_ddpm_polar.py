@@ -106,6 +106,52 @@ def masked_mse(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor,
     return num / den
 
 
+def region_mse_loss(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    region_labels: torch.Tensor,
+    lam_mandrel: float = 1.0,
+    lam_layers: float = 1.0,
+    lam_housing: float = 1.0,
+):
+    """Per-region NORMALISED MSE on the noise prediction, summed with per-region λ.
+
+    ``region_labels``: [B, 1, H, W] or [B, H, W] with
+        0 = padding, 1 = mandrel, 2 = layers, 3 = housing.
+
+    Each region's MSE is the mean squared (pred - target) error over *that
+    region's* pixels only — normalised by the region's pixel count, so its
+    contribution is independent of how large the region is in a given image:
+
+        L = λ_mandrel · MSE_mandrel + λ_layers · MSE_layers + λ_housing · MSE_housing
+
+    Padding (label 0) is never included in any region, so it is excluded from
+    the loss automatically.
+
+    Returns
+    -------
+    total      : scalar tensor (the loss to minimise)
+    per_region : dict {"mandrel": Tensor, "layers": Tensor, "housing": Tensor}
+                 the individual (un-weighted) per-region MSEs, for logging.
+    """
+    if region_labels.dim() == 3:
+        region_labels = region_labels[:, None, :, :]
+    region_labels = region_labels.to(device=pred.device)
+    se = (pred - target) ** 2
+
+    per_region = {}
+    total = pred.new_zeros(())
+    for cls, lam, name in ((1, lam_mandrel, "mandrel"),
+                           (2, lam_layers, "layers"),
+                           (3, lam_housing, "housing")):
+        m = (region_labels == cls).to(dtype=pred.dtype)
+        denom = m.sum().clamp_min(1.0)
+        mse_r = (se * m).sum() / denom
+        per_region[name] = mse_r
+        total = total + float(lam) * mse_r
+    return total, per_region
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -158,31 +204,40 @@ def run_eval(
     diffusion: Diffusion,
     device: torch.device,
     use_ema: bool = False,
-) -> float:
+    lam_mandrel: float = 1.0,
+    lam_layers: float = 1.0,
+    lam_housing: float = 1.0,
+):
+    """Returns (total_loss, {"mandrel":.., "layers":.., "housing":..}) — all means."""
     net = ema_model if use_ema else model
     net.eval()
     total = 0.0
     count = 0
+    reg_acc = {"mandrel": 0.0, "layers": 0.0, "housing": 0.0}
     with torch.no_grad():
         for batch in loader:
-            x, cond, mask = batch[0], batch[1], batch[2]
-            weights = batch[3] if len(batch) > 3 else None
+            x, cond = batch[0], batch[1]
+            labels = batch[3] if len(batch) > 3 else None
             bs = int(x.shape[0])
             x = x.to(device)
-            mask = mask.to(device)
-            if weights is not None:
-                weights = weights.to(device)
+            if labels is not None:
+                labels = labels.to(device)
             cat, cont = cond
             cat = cat.to(device)
             cont = cont.to(device)
             t = diffusion.sample_timesteps(bs, device=device)
             x_t, noise = diffusion.noise_images(x, t)
             pred = net(x_t, t, (cat, cont))
-            loss = masked_mse(pred, noise, mask, weights).item()
-            total += float(loss) * bs
+            loss_t, per_region = region_mse_loss(
+                pred, noise, labels, lam_mandrel, lam_layers, lam_housing,
+            )
+            total += float(loss_t.item()) * bs
+            for k in reg_acc:
+                reg_acc[k] += float(per_region[k].item()) * bs
             count += bs
     net.train()
-    return float(total / max(1, count))
+    n = max(1, count)
+    return float(total / n), {k: reg_acc[k] / n for k in reg_acc}
 
 
 # ---------------------------------------------------------------------------
@@ -219,10 +274,13 @@ def main(argv: Optional[list] = None) -> int:
                         "for the qualitative samples.")
     p.add_argument("--p-uncond", type=float, default=0.1)
 
-    p.add_argument("--w-mandrel", type=float, default=3.0,
-                   help="Loss weight for the Mandrel<->layers transition corridor (±5 rows).")
-    p.add_argument("--w-ring", type=float, default=50.0,
-                   help="Loss weight for the whole cell-housing/can band (rows >= r_ring).")
+    p.add_argument("--lambda-mandrel", type=float, default=1.0,
+                   help="λ for the per-region-normalised Mandrel MSE term.")
+    p.add_argument("--lambda-schichten", type=float, default=1.0,
+                   help="λ for the per-region-normalised layers (winding) MSE term.")
+    p.add_argument("--lambda-gehaeuse", type=float, default=1.0,
+                   help="λ for the per-region-normalised housing/can MSE term. "
+                        "Total loss = λ_m·MSE_mandrel + λ_l·MSE_layers + λ_h·MSE_housing.")
 
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--run-dir", default=None)
@@ -250,6 +308,11 @@ def main(argv: Optional[list] = None) -> int:
 
     p.add_argument("--no-clearml", action="store_true", default=True)
     args = p.parse_args(argv)
+
+    # Per-region loss weights (λ) — reused for training, validation and test.
+    lam_m = float(args.lambda_mandrel)
+    lam_l = float(args.lambda_schichten)
+    lam_h = float(args.lambda_gehaeuse)
 
     # Polar config constants.
     N_r = int(getattr(project_config, "POLAR_N_R", 512))
@@ -305,7 +368,6 @@ def main(argv: Optional[list] = None) -> int:
             args.index, args.geometry,
             splits_json=args.splits, split="train",
             max_pictures=max_pics_rounded, seed=int(args.seed),
-            w_mandrel=float(args.w_mandrel), w_ring=float(args.w_ring),
         )
         print(
             f"Picture-budget mode: max_pictures={args.max_pictures} -> rounded={max_pics_rounded} "
@@ -316,7 +378,6 @@ def main(argv: Optional[list] = None) -> int:
             args.index, args.geometry,
             splits_json=args.splits, split="train",
             batch_size=int(args.batch_size), seed=int(args.seed), pad_to_batch=True,
-            w_mandrel=float(args.w_mandrel), w_ring=float(args.w_ring),
         )
 
     def _select_mid_slice_per_format(split_name: str) -> list:
@@ -355,14 +416,8 @@ def main(argv: Optional[list] = None) -> int:
     if not test_samples:
         raise RuntimeError("No test samples found.")
 
-    val_ds = BatteryCTPolarSelectedSamplesDataset(
-        args.index, args.geometry, samples=val_samples,
-        w_mandrel=float(args.w_mandrel), w_ring=float(args.w_ring),
-    )
-    test_ds = BatteryCTPolarSelectedSamplesDataset(
-        args.index, args.geometry, samples=test_samples,
-        w_mandrel=float(args.w_mandrel), w_ring=float(args.w_ring),
-    )
+    val_ds = BatteryCTPolarSelectedSamplesDataset(args.index, args.geometry, samples=val_samples)
+    test_ds = BatteryCTPolarSelectedSamplesDataset(args.index, args.geometry, samples=test_samples)
 
     if int(args.max_pictures) <= 0 and int(args.epochs) <= 0:
         args.epochs = int(args.slices_per_cell)
@@ -462,6 +517,7 @@ def main(argv: Optional[list] = None) -> int:
             model.train()
             optimizer.zero_grad(set_to_none=True)
             running = 0.0
+            running_region = {"mandrel": 0.0, "layers": 0.0, "housing": 0.0}
 
             use_tqdm = (bool(args.tqdm) or sys.stderr.isatty()) and tqdm is not None
             train_iter = train_loader
@@ -471,13 +527,12 @@ def main(argv: Optional[list] = None) -> int:
                 train_iter = pbar
 
             for step, batch in enumerate(train_iter, start=1):
-                x, cond, mask = batch[0], batch[1], batch[2]
-                weights = batch[3] if len(batch) > 3 else None
+                x, cond = batch[0], batch[1]
+                labels = batch[3] if len(batch) > 3 else None
                 global_step += 1
                 x = x.to(device)
-                mask = mask.to(device)
-                if weights is not None:
-                    weights = weights.to(device)
+                if labels is not None:
+                    labels = labels.to(device)
                 cat, cont = cond
                 cat = cat.to(device)
                 cont = cont.to(device)
@@ -489,7 +544,7 @@ def main(argv: Optional[list] = None) -> int:
 
                 with torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):
                     pred = model(x_t, t, cond_in)
-                    loss_raw = masked_mse(pred, noise, mask, weights)
+                    loss_raw, region_mse = region_mse_loss(pred, noise, labels, lam_m, lam_l, lam_h)
                     loss = loss_raw / max(1, int(args.accumulation_steps))
 
                 scaler.scale(loss).backward()
@@ -501,19 +556,33 @@ def main(argv: Optional[list] = None) -> int:
                     ema.step_ema(ema_model, model, step_start_ema=0)
 
                 running += float(loss.item())
+                for k in running_region:
+                    running_region[k] += float(region_mse[k].detach().item())
                 _append_csv_row(
                     batch_loss_csv,
-                    header=["epoch", "batch", "train_loss"],
-                    row=[epoch, step, float(loss_raw.detach().item())],
+                    header=["epoch", "batch", "train_loss",
+                            "mse_mandrel", "mse_layers", "mse_housing"],
+                    row=[epoch, step, float(loss_raw.detach().item()),
+                         float(region_mse["mandrel"].detach().item()),
+                         float(region_mse["layers"].detach().item()),
+                         float(region_mse["housing"].detach().item())],
                 )
                 if clearml_logger is not None:
                     clearml_logger.report_scalar("loss", "train", iteration=global_step, value=float(loss_raw.detach().item()))
                 if pbar is not None:
                     pbar.set_postfix({"loss": f"{float(loss.item()):.4f}"})
 
-            train_loss = running / max(1, len(train_loader))
-            val_loss = run_eval(val_loader, model, ema_model, diffusion, device, use_ema=(not bool(args.no_ema_val)))
-            print(f"Epoch {epoch:04d} | train={train_loss:.6f} | val={'ema' if not args.no_ema_val else 'raw'}={val_loss:.6f}")
+            nb = max(1, len(train_loader))
+            train_loss = running / nb
+            train_region = {k: running_region[k] / nb for k in running_region}
+            val_loss, val_region = run_eval(
+                val_loader, model, ema_model, diffusion, device,
+                use_ema=(not bool(args.no_ema_val)),
+                lam_mandrel=lam_m, lam_layers=lam_l, lam_housing=lam_h,
+            )
+            print(f"Epoch {epoch:04d} | train={train_loss:.6f} | "
+                  f"val={'ema' if not args.no_ema_val else 'raw'}={val_loss:.6f} | "
+                  f"val MSE M/L/H={val_region['mandrel']:.4f}/{val_region['layers']:.4f}/{val_region['housing']:.4f}")
 
             if clearml_logger is not None:
                 clearml_logger.report_scalar("loss_epoch", "train", iteration=epoch, value=float(train_loss))
@@ -649,8 +718,12 @@ def main(argv: Optional[list] = None) -> int:
 
             _append_csv_row(
                 epoch_loss_csv,
-                header=["epoch", "train_loss", "val_loss", "best_val"],
-                row=[epoch, float(train_loss), float(val_loss), float(best_val)],
+                header=["epoch", "train_loss", "val_loss", "best_val",
+                        "train_mse_mandrel", "train_mse_layers", "train_mse_housing",
+                        "val_mse_mandrel", "val_mse_layers", "val_mse_housing"],
+                row=[epoch, float(train_loss), float(val_loss), float(best_val),
+                     float(train_region["mandrel"]), float(train_region["layers"]), float(train_region["housing"]),
+                     float(val_region["mandrel"]), float(val_region["layers"]), float(val_region["housing"])],
             )
             if int(args.save_every) > 0 and (epoch % int(args.save_every) == 0):
                 torch.save({
@@ -686,12 +759,11 @@ def main(argv: Optional[list] = None) -> int:
         running = 0.0
 
         for batch_idx, batch in enumerate(train_iter, start=1):
-            x, cond, mask = batch[0], batch[1], batch[2]
-            weights = batch[3] if len(batch) > 3 else None
+            x, cond = batch[0], batch[1]
+            labels = batch[3] if len(batch) > 3 else None
             x = x.to(device)
-            mask = mask.to(device)
-            if weights is not None:
-                weights = weights.to(device)
+            if labels is not None:
+                labels = labels.to(device)
             cat, cont = cond
             cat = cat.to(device)
             cont = cont.to(device)
@@ -703,7 +775,7 @@ def main(argv: Optional[list] = None) -> int:
 
             with torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):
                 pred = model(x_t, t, cond_in)
-                loss_raw = masked_mse(pred, noise, mask, weights)
+                loss_raw, _ = region_mse_loss(pred, noise, labels, lam_m, lam_l, lam_h)
                 loss = loss_raw / max(1, int(args.accumulation_steps))
 
             scaler.scale(loss).backward()
@@ -729,7 +801,9 @@ def main(argv: Optional[list] = None) -> int:
 
             if next_val_at is not None and pictures_seen >= int(next_val_at):
                 while next_val_at is not None and pictures_seen >= int(next_val_at):
-                    val_loss = run_eval(val_loader, model, ema_model, diffusion, device, use_ema=(not bool(args.no_ema_val)))
+                    val_loss, _ = run_eval(val_loader, model, ema_model, diffusion, device,
+                                   use_ema=(not bool(args.no_ema_val)),
+                                   lam_mandrel=lam_m, lam_layers=lam_l, lam_housing=lam_h)
                     last_val_loss = float(val_loss)
                     if val_loss < best_val:
                         best_val = float(val_loss)
@@ -749,7 +823,9 @@ def main(argv: Optional[list] = None) -> int:
                     next_val_at = int(next_val_at) + int(args.val_every_pictures)
 
         if next_val_at is None:
-            val_loss = run_eval(val_loader, model, ema_model, diffusion, device, use_ema=(not bool(args.no_ema_val)))
+            val_loss, _ = run_eval(val_loader, model, ema_model, diffusion, device,
+                                   use_ema=(not bool(args.no_ema_val)),
+                                   lam_mandrel=lam_m, lam_layers=lam_l, lam_housing=lam_h)
             last_val_loss = float(val_loss)
             if val_loss < best_val:
                 best_val = float(val_loss)
@@ -776,16 +852,24 @@ def main(argv: Optional[list] = None) -> int:
 
     # --- Final test evaluation ---
     use_ema_val = not bool(args.no_ema_val)
-    test_loss = run_eval(test_loader, model, ema_model, diffusion, device, use_ema=use_ema_val)
+    test_loss, test_region = run_eval(
+        test_loader, model, ema_model, diffusion, device, use_ema=use_ema_val,
+        lam_mandrel=lam_m, lam_layers=lam_l, lam_housing=lam_h,
+    )
     with open(os.path.join(run_dir, "final_metrics.json"), "w", encoding="utf-8") as f:
         json.dump({
             "test_loss": test_loss,
+            "test_mse_mandrel": test_region["mandrel"],
+            "test_mse_layers": test_region["layers"],
+            "test_mse_housing": test_region["housing"],
             "best_val": best_val,
             "use_ema_val": bool(use_ema_val),
+            "lambda_mandrel": lam_m, "lambda_schichten": lam_l, "lambda_gehaeuse": lam_h,
             "N_r": N_r, "N_theta": N_theta,
         }, f, indent=2)
 
-    print(f"Test loss ({'ema' if use_ema_val else 'raw'}): {test_loss:.6f}")
+    print(f"Test loss ({'ema' if use_ema_val else 'raw'}): {test_loss:.6f} "
+          f"| M/L/H={test_region['mandrel']:.4f}/{test_region['layers']:.4f}/{test_region['housing']:.4f}")
     print(f"Run dir: {run_dir}")
     return 0
 
