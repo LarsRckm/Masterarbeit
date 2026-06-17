@@ -53,10 +53,25 @@ class Diffusion:
     def sample_timesteps(self, n: int, device: torch.device) -> torch.Tensor:
         return torch.randint(low=1, high=self.noise_steps, size=(n,), device=device)
 
-    def noise_images(self, x: torch.Tensor, t: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    @staticmethod
+    def _offset(eps: torch.Tensor, offset_noise: float) -> torch.Tensor:
+        """Add a per-image/channel constant DC offset to the noise (offset noise).
+
+        eps -> eps + c * z, with one z ~ N(0,1) per (image, channel), broadcast over
+        all pixels. Injects low-frequency/brightness content into the noise so the
+        model learns to control the global brightness (counteracts DC drift).
+        """
+        if offset_noise <= 0.0:
+            return eps
+        z = torch.randn(eps.shape[0], eps.shape[1], 1, 1, device=eps.device, dtype=eps.dtype)
+        return eps + float(offset_noise) * z
+
+    def noise_images(self, x: torch.Tensor, t: torch.Tensor,
+                     offset_noise: float = 0.0) -> Tuple[torch.Tensor, torch.Tensor]:
         """Add noise at timestep t.
 
         If x has channels [image, mask], only diffuse the image channel.
+        ``offset_noise`` > 0 enables offset noise on the image channel.
         Returns (x_t, epsilon) where epsilon is the noise added to the image channel.
         """
 
@@ -67,10 +82,24 @@ class Diffusion:
             # Channel 0 = image (noised), channels 1+ = mask/radial map (kept clean)
             x_img  = x[:, :1]
             x_rest = x[:, 1:]
-            eps = torch.randn_like(x_img)
+            eps = self._offset(torch.randn_like(x_img), offset_noise)
             x_noised = sqrt_alpha_hat * x_img + sqrt_one_minus_alpha_hat * eps
             return torch.cat([x_noised, x_rest], dim=1), eps
 
-        eps = torch.randn_like(x)
+        eps = self._offset(torch.randn_like(x), offset_noise)
         x_noised = sqrt_alpha_hat * x + sqrt_one_minus_alpha_hat * eps
         return x_noised, eps
+
+    # --- v-prediction helpers (Salimans & Ho, 2022) -----------------------
+    # v = sqrt(alpha_hat) * eps - sqrt(1-alpha_hat) * x0
+    def get_v(self, x0: torch.Tensor, eps: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        """Velocity target v for v-prediction (x0, eps both [B,1,H,W])."""
+        a = torch.sqrt(self.alpha_hat[t])[:, None, None, None]
+        s = torch.sqrt(1.0 - self.alpha_hat[t])[:, None, None, None]
+        return a * eps - s * x0
+
+    def v_to_eps(self, x_t: torch.Tensor, v: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        """Convert a predicted v back to the equivalent epsilon (for the reverse step)."""
+        a = torch.sqrt(self.alpha_hat[t])[:, None, None, None]
+        s = torch.sqrt(1.0 - self.alpha_hat[t])[:, None, None, None]
+        return s * x_t + a * v

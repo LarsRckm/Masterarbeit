@@ -118,12 +118,16 @@ def _sample_ddpm(
     device: torch.device,
     mask: torch.Tensor = None,
     radial_map: torch.Tensor = None,
+    prediction_type: str = "eps",
 ) -> torch.Tensor:
     """Full DDPM reverse process.
 
     The mask (1=valid, 0=padding) is concatenated to the noisy image at every
     step so the model can condition on the cell boundary.  If not provided, a
     uniform circular mask is built from r_valid_row.
+
+    ``prediction_type`` 'v' converts the model's velocity output back to epsilon
+    before the reverse step (must match how the checkpoint was trained).
     """
     if mask is None:
         mask = _build_mask(n, N_r, N_theta, r_valid_row, device)
@@ -140,6 +144,8 @@ def _sample_ddpm(
         if float(cfg_scale) != 1.0:
             uncond = model(model_in, t, None)
             pred = uncond + float(cfg_scale) * (pred - uncond)
+        if prediction_type == "v":
+            pred = diffusion.v_to_eps(x, pred, t)   # v -> epsilon
 
         alpha     = diffusion.alpha[t][:, None, None, None]
         alpha_hat = diffusion.alpha_hat[t][:, None, None, None]
@@ -171,10 +177,12 @@ def _sample_ddim(
     ddim_eta: float,
     mask: torch.Tensor = None,
     radial_map: torch.Tensor = None,
+    prediction_type: str = "eps",
 ) -> torch.Tensor:
     """DDIM reverse process (fewer steps).
 
     mask and radial_map are concatenated to the noisy image at every step.
+    ``prediction_type`` 'v' converts the velocity output back to epsilon.
     """
     if mask is None:
         mask = _build_mask(n, N_r, N_theta, r_valid_row, device)
@@ -199,6 +207,8 @@ def _sample_ddim(
         if float(cfg_scale) != 1.0:
             uncond = model(model_in, t, None)
             pred = uncond + float(cfg_scale) * (pred - uncond)
+        if prediction_type == "v":
+            pred = diffusion.v_to_eps(x, pred, t)   # v -> epsilon
 
         alpha_hat_t = diffusion.alpha_hat[t][:, None, None, None]
         t_next_t    = torch.full((n,), t_next, device=device, dtype=torch.long)
@@ -268,6 +278,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--noise-steps", type=int,   default=1000)
     p.add_argument("--beta-schedule", choices=["linear", "cosine"], default="linear",
                    help="Must match the schedule used during training of --ckpt (V6 default: linear).")
+    p.add_argument("--prediction-type", choices=["eps", "v"], default="eps",
+                   help="Model target: 'eps' or 'v'. Must match how --ckpt was trained.")
     p.add_argument("--beta-start",  type=float, default=1e-4)
     p.add_argument("--beta-end",    type=float, default=0.02)
 
@@ -419,6 +431,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             cfg_scale=float(args.cfg_scale), device=device,
             ddim_steps=int(args.ddim_steps), ddim_eta=float(args.ddim_eta),
             mask=mask, radial_map=radial_map,
+            prediction_type=str(args.prediction_type),
         )
     else:
         samples = _sample_ddpm(
@@ -427,6 +440,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             r_valid_row=r_valid_row, pad_value=pad_value,
             cfg_scale=float(args.cfg_scale), device=device,
             mask=mask, radial_map=radial_map,
+            prediction_type=str(args.prediction_type),
         )
 
     # samples: [n, 1, N_r, N_theta] on device
@@ -476,6 +490,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         "cart_size": cart_size,
         "mask_from_cell": bool(args.mask_from_cell),
         "no_radial_map": bool(args.no_radial_map),
+        "prediction_type": str(args.prediction_type),
         "mask_cell_id": used_cell_id,
         "conditions": {
             "cell_format": cell_format,

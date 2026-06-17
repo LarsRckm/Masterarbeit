@@ -113,8 +113,9 @@ def region_mse_loss(
     lam_mandrel: float = 1.0,
     lam_layers: float = 1.0,
     lam_housing: float = 1.0,
+    lam_global: float = 0.0,
 ):
-    """Per-region NORMALISED MSE on the noise prediction, summed with per-region λ.
+    """Per-region NORMALISED MSE on the prediction target (eps or v), summed with λ.
 
     ``region_labels``: [B, 1, H, W] or [B, H, W] with
         0 = padding, 1 = mandrel, 2 = layers, 3 = housing.
@@ -123,20 +124,33 @@ def region_mse_loss(
     region's* pixels only — normalised by the region's pixel count, so its
     contribution is independent of how large the region is in a given image:
 
-        L = λ_mandrel · MSE_mandrel + λ_layers · MSE_layers + λ_housing · MSE_housing
+        L = λ_global · MSE_global
+          + λ_mandrel · MSE_mandrel + λ_layers · MSE_layers + λ_housing · MSE_housing
 
-    Padding (label 0) is never included in any region, so it is excluded from
-    the loss automatically.
+    ``lam_global`` > 0 adds an area-weighted MSE over ALL valid (non-padding)
+    pixels — the "hybrid" loss. The global term is area-coupled and therefore
+    damps the global-brightness (DC) tug-of-war that the area-decoupled
+    per-region terms create. With ``lam_global == 0`` only the per-region terms
+    remain (pure per-region loss).
+
+    Padding (label 0) is never included in any region nor the global term.
 
     Returns
     -------
     total      : scalar tensor (the loss to minimise)
-    per_region : dict {"mandrel": Tensor, "layers": Tensor, "housing": Tensor}
-                 the individual (un-weighted) per-region MSEs, for logging.
+    per_region : dict {"mandrel", "layers", "housing", "global"} of the
+                 individual (un-weighted) MSEs, for logging.
     """
     if region_labels.dim() == 3:
         region_labels = region_labels[:, None, :, :]
     region_labels = region_labels.to(device=pred.device)
+
+    # IMPORTANT: compute the loss in float32 even under autocast. The sums below
+    # run over hundreds of thousands of pixels per region; in float16 (max ~65504)
+    # both the squared errors and the reductions overflow, which corrupts the loss
+    # value (and the logged per-region MSEs) into huge/garbage numbers.
+    pred = pred.float()
+    target = target.float()
     se = (pred - target) ** 2
 
     per_region = {}
@@ -144,11 +158,19 @@ def region_mse_loss(
     for cls, lam, name in ((1, lam_mandrel, "mandrel"),
                            (2, lam_layers, "layers"),
                            (3, lam_housing, "housing")):
-        m = (region_labels == cls).to(dtype=pred.dtype)
+        m = (region_labels == cls).to(dtype=torch.float32)
         denom = m.sum().clamp_min(1.0)
         mse_r = (se * m).sum() / denom
         per_region[name] = mse_r
         total = total + float(lam) * mse_r
+
+    # Global (area-weighted, masked) term — hybrid loss when lam_global > 0.
+    valid = (region_labels > 0).to(dtype=torch.float32)
+    mse_global = (se * valid).sum() / valid.sum().clamp_min(1.0)
+    per_region["global"] = mse_global
+    if float(lam_global) > 0.0:
+        total = total + float(lam_global) * mse_global
+
     return total, per_region
 
 
@@ -207,13 +229,16 @@ def run_eval(
     lam_mandrel: float = 1.0,
     lam_layers: float = 1.0,
     lam_housing: float = 1.0,
+    lam_global: float = 0.0,
+    prediction_type: str = "eps",
+    offset_noise: float = 0.0,
 ):
-    """Returns (total_loss, {"mandrel":.., "layers":.., "housing":..}) — all means."""
+    """Returns (total_loss, {"mandrel","layers","housing","global"}) — all means."""
     net = ema_model if use_ema else model
     net.eval()
     total = 0.0
     count = 0
-    reg_acc = {"mandrel": 0.0, "layers": 0.0, "housing": 0.0}
+    reg_acc = {"mandrel": 0.0, "layers": 0.0, "housing": 0.0, "global": 0.0}
     with torch.no_grad():
         for batch in loader:
             x, cond = batch[0], batch[1]
@@ -226,10 +251,11 @@ def run_eval(
             cat = cat.to(device)
             cont = cont.to(device)
             t = diffusion.sample_timesteps(bs, device=device)
-            x_t, noise = diffusion.noise_images(x, t)
+            x_t, noise = diffusion.noise_images(x, t, offset_noise=offset_noise)
             pred = net(x_t, t, (cat, cont))
+            target = diffusion.get_v(x[:, :1], noise, t) if prediction_type == "v" else noise
             loss_t, per_region = region_mse_loss(
-                pred, noise, labels, lam_mandrel, lam_layers, lam_housing,
+                pred, target, labels, lam_mandrel, lam_layers, lam_housing, lam_global,
             )
             total += float(loss_t.item()) * bs
             for k in reg_acc:
@@ -279,8 +305,21 @@ def main(argv: Optional[list] = None) -> int:
     p.add_argument("--lambda-schichten", type=float, default=1.0,
                    help="λ for the per-region-normalised layers (winding) MSE term.")
     p.add_argument("--lambda-gehaeuse", type=float, default=1.0,
-                   help="λ for the per-region-normalised housing/can MSE term. "
-                        "Total loss = λ_m·MSE_mandrel + λ_l·MSE_layers + λ_h·MSE_housing.")
+                   help="λ for the per-region-normalised housing/can MSE term.")
+
+    p.add_argument("--prediction-type", choices=["eps", "v"], default="eps",
+                   help="Model target: 'eps' (noise) or 'v' (velocity, Salimans & Ho). "
+                        "v makes the high-t target contain x0 -> better global brightness. "
+                        "Must match between training and sampling.")
+    p.add_argument("--loss-type", choices=["global", "region"], default="region",
+                   help="'region': only the per-region terms (λ_m/λ_l/λ_h). "
+                        "'global': HYBRID = an area-weighted global MSE term (λ_global) PLUS "
+                        "the per-region terms — the global term damps the brightness oscillation.")
+    p.add_argument("--lambda-global", type=float, default=1.0,
+                   help="λ for the area-weighted global MSE term (only used with --loss-type global).")
+    p.add_argument("--offset-noise", type=float, default=0.0,
+                   help="Offset-noise strength c (0 = off, ~0.1 = on). Adds a per-image DC offset "
+                        "to the training noise so the model learns the global brightness.")
 
     p.add_argument("--no-radial-map", action="store_true",
                    help="A/B ablation: zero the radial-map conditioning channel (ch2). "
@@ -318,6 +357,10 @@ def main(argv: Optional[list] = None) -> int:
     lam_m = float(args.lambda_mandrel)
     lam_l = float(args.lambda_schichten)
     lam_h = float(args.lambda_gehaeuse)
+    # Global (area-weighted) term only active in the hybrid 'global' loss type.
+    lam_g = float(args.lambda_global) if str(args.loss_type) == "global" else 0.0
+    pred_type = str(args.prediction_type)
+    offset_noise = float(args.offset_noise)
     use_radial = not bool(args.no_radial_map)   # radial-map A/B ablation
 
     # Polar config constants.
@@ -527,7 +570,7 @@ def main(argv: Optional[list] = None) -> int:
             model.train()
             optimizer.zero_grad(set_to_none=True)
             running = 0.0
-            running_region = {"mandrel": 0.0, "layers": 0.0, "housing": 0.0}
+            running_region = {"mandrel": 0.0, "layers": 0.0, "housing": 0.0, "global": 0.0}
 
             use_tqdm = (bool(args.tqdm) or sys.stderr.isatty()) and tqdm is not None
             train_iter = train_loader
@@ -550,11 +593,13 @@ def main(argv: Optional[list] = None) -> int:
                 cond_in = None if (float(args.p_uncond) > 0 and random.random() < float(args.p_uncond)) else (cat, cont)
 
                 t = diffusion.sample_timesteps(x.shape[0], device=device)
-                x_t, noise = diffusion.noise_images(x, t)
+                x_t, noise = diffusion.noise_images(x, t, offset_noise=offset_noise)
 
                 with torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):
                     pred = model(x_t, t, cond_in)
-                    loss_raw, region_mse = region_mse_loss(pred, noise, labels, lam_m, lam_l, lam_h)
+                    target = diffusion.get_v(x[:, :1], noise, t) if pred_type == "v" else noise
+                    loss_raw, region_mse = region_mse_loss(
+                        pred, target, labels, lam_m, lam_l, lam_h, lam_g)
                     loss = loss_raw / max(1, int(args.accumulation_steps))
 
                 scaler.scale(loss).backward()
@@ -571,11 +616,12 @@ def main(argv: Optional[list] = None) -> int:
                 _append_csv_row(
                     batch_loss_csv,
                     header=["epoch", "batch", "train_loss",
-                            "mse_mandrel", "mse_layers", "mse_housing"],
+                            "mse_mandrel", "mse_layers", "mse_housing", "mse_global"],
                     row=[epoch, step, float(loss_raw.detach().item()),
                          float(region_mse["mandrel"].detach().item()),
                          float(region_mse["layers"].detach().item()),
-                         float(region_mse["housing"].detach().item())],
+                         float(region_mse["housing"].detach().item()),
+                         float(region_mse["global"].detach().item())],
                 )
                 if clearml_logger is not None:
                     clearml_logger.report_scalar("loss", "train", iteration=global_step, value=float(loss_raw.detach().item()))
@@ -588,7 +634,8 @@ def main(argv: Optional[list] = None) -> int:
             val_loss, val_region = run_eval(
                 val_loader, model, ema_model, diffusion, device,
                 use_ema=(not bool(args.no_ema_val)),
-                lam_mandrel=lam_m, lam_layers=lam_l, lam_housing=lam_h,
+                lam_mandrel=lam_m, lam_layers=lam_l, lam_housing=lam_h, lam_global=lam_g,
+                prediction_type=pred_type, offset_noise=offset_noise,
             )
             print(f"Epoch {epoch:04d} | train={train_loss:.6f} | "
                   f"val={'ema' if not args.no_ema_val else 'raw'}={val_loss:.6f} | "
@@ -667,6 +714,7 @@ def main(argv: Optional[list] = None) -> int:
                                     r_valid_row=r_valid_row, pad_value=pad_value,
                                     cfg_scale=float(args.sample_cfg_scale), device=device,
                                     mask=mask_cond, radial_map=radial_cond,
+                                    prediction_type=pred_type,
                                 )
                                 if args.sample_sampler == "ddim":
                                     _sample_kwargs["ddim_steps"] = int(args.sample_ddim_steps)
@@ -729,11 +777,13 @@ def main(argv: Optional[list] = None) -> int:
             _append_csv_row(
                 epoch_loss_csv,
                 header=["epoch", "train_loss", "val_loss", "best_val",
-                        "train_mse_mandrel", "train_mse_layers", "train_mse_housing",
-                        "val_mse_mandrel", "val_mse_layers", "val_mse_housing"],
+                        "train_mse_mandrel", "train_mse_layers", "train_mse_housing", "train_mse_global",
+                        "val_mse_mandrel", "val_mse_layers", "val_mse_housing", "val_mse_global"],
                 row=[epoch, float(train_loss), float(val_loss), float(best_val),
-                     float(train_region["mandrel"]), float(train_region["layers"]), float(train_region["housing"]),
-                     float(val_region["mandrel"]), float(val_region["layers"]), float(val_region["housing"])],
+                     float(train_region["mandrel"]), float(train_region["layers"]),
+                     float(train_region["housing"]), float(train_region["global"]),
+                     float(val_region["mandrel"]), float(val_region["layers"]),
+                     float(val_region["housing"]), float(val_region["global"])],
             )
             if int(args.save_every) > 0 and (epoch % int(args.save_every) == 0):
                 torch.save({
@@ -781,11 +831,13 @@ def main(argv: Optional[list] = None) -> int:
             cond_in = None if (float(args.p_uncond) > 0 and random.random() < float(args.p_uncond)) else (cat, cont)
 
             t = diffusion.sample_timesteps(x.shape[0], device=device)
-            x_t, noise = diffusion.noise_images(x, t)
+            x_t, noise = diffusion.noise_images(x, t, offset_noise=offset_noise)
 
             with torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):
                 pred = model(x_t, t, cond_in)
-                loss_raw, _ = region_mse_loss(pred, noise, labels, lam_m, lam_l, lam_h)
+                target = diffusion.get_v(x[:, :1], noise, t) if pred_type == "v" else noise
+                loss_raw, _ = region_mse_loss(
+                    pred, target, labels, lam_m, lam_l, lam_h, lam_g)
                 loss = loss_raw / max(1, int(args.accumulation_steps))
 
             scaler.scale(loss).backward()
@@ -813,7 +865,8 @@ def main(argv: Optional[list] = None) -> int:
                 while next_val_at is not None and pictures_seen >= int(next_val_at):
                     val_loss, _ = run_eval(val_loader, model, ema_model, diffusion, device,
                                    use_ema=(not bool(args.no_ema_val)),
-                                   lam_mandrel=lam_m, lam_layers=lam_l, lam_housing=lam_h)
+                                   lam_mandrel=lam_m, lam_layers=lam_l, lam_housing=lam_h,
+                                   lam_global=lam_g, prediction_type=pred_type, offset_noise=offset_noise)
                     last_val_loss = float(val_loss)
                     if val_loss < best_val:
                         best_val = float(val_loss)
@@ -835,7 +888,8 @@ def main(argv: Optional[list] = None) -> int:
         if next_val_at is None:
             val_loss, _ = run_eval(val_loader, model, ema_model, diffusion, device,
                                    use_ema=(not bool(args.no_ema_val)),
-                                   lam_mandrel=lam_m, lam_layers=lam_l, lam_housing=lam_h)
+                                   lam_mandrel=lam_m, lam_layers=lam_l, lam_housing=lam_h,
+                                   lam_global=lam_g, prediction_type=pred_type, offset_noise=offset_noise)
             last_val_loss = float(val_loss)
             if val_loss < best_val:
                 best_val = float(val_loss)
@@ -864,7 +918,8 @@ def main(argv: Optional[list] = None) -> int:
     use_ema_val = not bool(args.no_ema_val)
     test_loss, test_region = run_eval(
         test_loader, model, ema_model, diffusion, device, use_ema=use_ema_val,
-        lam_mandrel=lam_m, lam_layers=lam_l, lam_housing=lam_h,
+        lam_mandrel=lam_m, lam_layers=lam_l, lam_housing=lam_h, lam_global=lam_g,
+        prediction_type=pred_type, offset_noise=offset_noise,
     )
     with open(os.path.join(run_dir, "final_metrics.json"), "w", encoding="utf-8") as f:
         json.dump({
