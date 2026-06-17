@@ -144,18 +144,29 @@ def _sample_ddpm(
         if float(cfg_scale) != 1.0:
             uncond = model(model_in, t, None)
             pred = uncond + float(cfg_scale) * (pred - uncond)
-        if prediction_type == "v":
-            pred = diffusion.v_to_eps(x, pred, t)   # v -> epsilon
 
         alpha     = diffusion.alpha[t][:, None, None, None]
         alpha_hat = diffusion.alpha_hat[t][:, None, None, None]
         beta      = diffusion.beta[t][:, None, None, None]
         noise = torch.randn_like(x) if i > 1 else torch.zeros_like(x)
-        x = (
-            (1.0 / torch.sqrt(alpha))
-            * (x - ((1 - alpha) / torch.sqrt(1 - alpha_hat)) * pred)
-            + torch.sqrt(beta) * noise
-        )
+
+        if prediction_type == "v":
+            # x0-parameterised posterior — stable even at zero terminal SNR
+            # (alpha_hat=0), where the 1/sqrt(alpha) eps-form blows up.
+            x0 = diffusion.v_to_x0(x, pred, t)
+            t_prev = torch.full((n,), i - 1, device=device, dtype=torch.long)
+            alpha_hat_prev = diffusion.alpha_hat[t_prev][:, None, None, None]
+            one_minus = (1.0 - alpha_hat).clamp_min(1e-8)
+            mean = (torch.sqrt(alpha_hat_prev) * beta / one_minus) * x0 \
+                 + (torch.sqrt(alpha) * (1.0 - alpha_hat_prev) / one_minus) * x
+            var = ((1.0 - alpha_hat_prev) / one_minus) * beta
+            x = mean + torch.sqrt(var.clamp_min(0.0)) * noise
+        else:
+            x = (
+                (1.0 / torch.sqrt(alpha))
+                * (x - ((1 - alpha) / torch.sqrt(1 - alpha_hat)) * pred)
+                + torch.sqrt(beta) * noise
+            )
         x[:, :, r_valid_row:, :] = pad_value
 
     return x   # [n, 1, N_r, N_theta] — only the image channel
@@ -207,14 +218,18 @@ def _sample_ddim(
         if float(cfg_scale) != 1.0:
             uncond = model(model_in, t, None)
             pred = uncond + float(cfg_scale) * (pred - uncond)
-        if prediction_type == "v":
-            pred = diffusion.v_to_eps(x, pred, t)   # v -> epsilon
 
         alpha_hat_t = diffusion.alpha_hat[t][:, None, None, None]
         t_next_t    = torch.full((n,), t_next, device=device, dtype=torch.long)
         alpha_hat_s = diffusion.alpha_hat[t_next_t][:, None, None, None]
 
-        x0 = (x - torch.sqrt(1.0 - alpha_hat_t) * pred) / torch.sqrt(alpha_hat_t).clamp(min=1e-8)
+        if prediction_type == "v":
+            x0  = diffusion.v_to_x0(x, pred, t)     # division-free (ZTSNR-safe)
+            eps = diffusion.v_to_eps(x, pred, t)
+        else:
+            eps = pred
+            x0  = (x - torch.sqrt(1.0 - alpha_hat_t) * eps) / torch.sqrt(alpha_hat_t).clamp(min=1e-8)
+
         sigma = ddim_eta * torch.sqrt(
             (1.0 - alpha_hat_s) / (1.0 - alpha_hat_t).clamp(min=1e-8)
             * (1.0 - alpha_hat_t / alpha_hat_s.clamp(min=1e-8))
@@ -222,7 +237,7 @@ def _sample_ddim(
         noise = torch.randn_like(x) if ddim_eta > 0.0 else torch.zeros_like(x)
         x = (
             torch.sqrt(alpha_hat_s) * x0
-            + torch.sqrt(torch.clamp(1.0 - alpha_hat_s - sigma ** 2, min=0.0)) * pred
+            + torch.sqrt(torch.clamp(1.0 - alpha_hat_s - sigma ** 2, min=0.0)) * eps
             + sigma * noise
         )
         x[:, :, r_valid_row:, :] = pad_value
@@ -280,6 +295,9 @@ def main(argv: Optional[List[str]] = None) -> int:
                    help="Must match the schedule used during training of --ckpt (V6 default: linear).")
     p.add_argument("--prediction-type", choices=["eps", "v"], default="eps",
                    help="Model target: 'eps' or 'v'. Must match how --ckpt was trained.")
+    p.add_argument("--zero-terminal-snr", action="store_true",
+                   help="Rescale schedule so alpha_hat[-1]=0. Requires --prediction-type v. "
+                        "Must match how --ckpt was trained.")
     p.add_argument("--beta-start",  type=float, default=1e-4)
     p.add_argument("--beta-end",    type=float, default=0.02)
 
@@ -401,11 +419,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     model.eval()
     print(f"Loaded {'EMA' if not args.no_ema else 'raw'} weights from: {args.ckpt}")
 
+    if bool(args.zero_terminal_snr) and str(args.prediction_type) != "v":
+        raise SystemExit("--zero-terminal-snr requires --prediction-type v.")
     diffusion = Diffusion(
         noise_steps=int(args.noise_steps),
         beta_start=float(args.beta_start),
         beta_end=float(args.beta_end),
         schedule=str(args.beta_schedule),
+        zero_terminal_snr=bool(args.zero_terminal_snr),
     ).to(device)
 
     # --- Row cutoff (padding region) ---
@@ -491,6 +512,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         "mask_from_cell": bool(args.mask_from_cell),
         "no_radial_map": bool(args.no_radial_map),
         "prediction_type": str(args.prediction_type),
+        "zero_terminal_snr": bool(args.zero_terminal_snr),
         "mask_cell_id": used_cell_id,
         "conditions": {
             "cell_format": cell_format,

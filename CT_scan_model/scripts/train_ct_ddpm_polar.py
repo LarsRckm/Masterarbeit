@@ -311,6 +311,10 @@ def main(argv: Optional[list] = None) -> int:
                    help="Model target: 'eps' (noise) or 'v' (velocity, Salimans & Ho). "
                         "v makes the high-t target contain x0 -> better global brightness. "
                         "Must match between training and sampling.")
+    p.add_argument("--zero-terminal-snr", action="store_true",
+                   help="Rescale the schedule so alpha_hat[-1]=0 (Lin et al.) -> the terminal "
+                        "step is pure noise, removing the brightness train/test mismatch. "
+                        "Requires --prediction-type v. Must match between training and sampling.")
     p.add_argument("--loss-type", choices=["global", "region"], default="region",
                    help="'region': only the per-region terms (λ_m/λ_l/λ_h). "
                         "'global': HYBRID = an area-weighted global MSE term (λ_global) PLUS "
@@ -362,6 +366,9 @@ def main(argv: Optional[list] = None) -> int:
     pred_type = str(args.prediction_type)
     offset_noise = float(args.offset_noise)
     use_radial = not bool(args.no_radial_map)   # radial-map A/B ablation
+    if bool(args.zero_terminal_snr) and pred_type != "v":
+        raise SystemExit("--zero-terminal-snr requires --prediction-type v "
+                         "(eps-prediction is degenerate at alpha_hat=0).")
 
     # Polar config constants.
     N_r = int(getattr(project_config, "POLAR_N_R", 512))
@@ -515,6 +522,7 @@ def main(argv: Optional[list] = None) -> int:
         beta_start=float(args.beta_start),
         beta_end=float(args.beta_end),
         schedule=str(args.beta_schedule),
+        zero_terminal_snr=bool(args.zero_terminal_snr),
     ).to(device)
     scaler = torch.cuda.amp.GradScaler(enabled=torch.cuda.is_available())
 

@@ -33,6 +33,7 @@ class Diffusion:
     beta_start: float = 1e-4
     beta_end: float = 0.02
     schedule: str = "linear"
+    zero_terminal_snr: bool = False
 
     def __post_init__(self):
         if self.schedule == "cosine":
@@ -43,6 +44,28 @@ class Diffusion:
             raise ValueError(f"Unknown schedule: {self.schedule!r} (expected 'linear' or 'cosine')")
         self.alpha = 1.0 - self.beta
         self.alpha_hat = torch.cumprod(self.alpha, dim=0)
+        if self.zero_terminal_snr:
+            self._rescale_zero_terminal_snr()
+
+    def _rescale_zero_terminal_snr(self) -> None:
+        """Rescale the schedule so alpha_hat[-1] = 0 (Lin et al., 2024).
+
+        Keeps sqrt(alpha_hat)[0] unchanged, shifts/scales so sqrt(alpha_hat)[-1] = 0,
+        then recomputes alpha and beta. After this the most-noised step is *pure*
+        noise (no leaked signal), removing the train/test brightness mismatch.
+        Requires v-prediction (eps-prediction is degenerate at alpha_hat = 0).
+        """
+        sqrt_ah = torch.sqrt(self.alpha_hat)
+        s0 = sqrt_ah[0].clone()
+        sT = sqrt_ah[-1].clone()
+        sqrt_ah = (sqrt_ah - sT) * (s0 / (s0 - sT))      # s0 -> s0, sT -> 0
+        alpha_hat = sqrt_ah ** 2
+        alpha = torch.empty_like(alpha_hat)
+        alpha[0] = alpha_hat[0]
+        alpha[1:] = alpha_hat[1:] / alpha_hat[:-1]
+        self.alpha_hat = alpha_hat
+        self.alpha = alpha
+        self.beta = 1.0 - alpha
 
     def to(self, device: torch.device) -> "Diffusion":
         self.beta = self.beta.to(device)
@@ -103,3 +126,13 @@ class Diffusion:
         a = torch.sqrt(self.alpha_hat[t])[:, None, None, None]
         s = torch.sqrt(1.0 - self.alpha_hat[t])[:, None, None, None]
         return s * x_t + a * v
+
+    def v_to_x0(self, x_t: torch.Tensor, v: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        """Convert a predicted v back to the clean-image estimate x0 (division-free).
+
+        x0 = sqrt(alpha_hat) * x_t - sqrt(1-alpha_hat) * v. Stable even when
+        alpha_hat = 0 (zero terminal SNR), unlike (x_t - s*eps)/sqrt(alpha_hat).
+        """
+        a = torch.sqrt(self.alpha_hat[t])[:, None, None, None]
+        s = torch.sqrt(1.0 - self.alpha_hat[t])[:, None, None, None]
+        return a * x_t - s * v
