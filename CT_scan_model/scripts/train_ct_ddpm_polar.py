@@ -282,6 +282,11 @@ def main(argv: Optional[list] = None) -> int:
                    help="λ for the per-region-normalised housing/can MSE term. "
                         "Total loss = λ_m·MSE_mandrel + λ_l·MSE_layers + λ_h·MSE_housing.")
 
+    p.add_argument("--no-radial-map", action="store_true",
+                   help="A/B ablation: zero the radial-map conditioning channel (ch2). "
+                        "Functionally equivalent to a 2-channel model (image+mask). Must be "
+                        "set identically for training and sampling of the same checkpoint.")
+
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--run-dir", default=None)
     p.add_argument("--save-every", type=int, default=0)
@@ -313,6 +318,7 @@ def main(argv: Optional[list] = None) -> int:
     lam_m = float(args.lambda_mandrel)
     lam_l = float(args.lambda_schichten)
     lam_h = float(args.lambda_gehaeuse)
+    use_radial = not bool(args.no_radial_map)   # radial-map A/B ablation
 
     # Polar config constants.
     N_r = int(getattr(project_config, "POLAR_N_R", 512))
@@ -368,6 +374,7 @@ def main(argv: Optional[list] = None) -> int:
             args.index, args.geometry,
             splits_json=args.splits, split="train",
             max_pictures=max_pics_rounded, seed=int(args.seed),
+            use_radial_map=use_radial,
         )
         print(
             f"Picture-budget mode: max_pictures={args.max_pictures} -> rounded={max_pics_rounded} "
@@ -378,6 +385,7 @@ def main(argv: Optional[list] = None) -> int:
             args.index, args.geometry,
             splits_json=args.splits, split="train",
             batch_size=int(args.batch_size), seed=int(args.seed), pad_to_batch=True,
+            use_radial_map=use_radial,
         )
 
     def _select_mid_slice_per_format(split_name: str) -> list:
@@ -416,8 +424,10 @@ def main(argv: Optional[list] = None) -> int:
     if not test_samples:
         raise RuntimeError("No test samples found.")
 
-    val_ds = BatteryCTPolarSelectedSamplesDataset(args.index, args.geometry, samples=val_samples)
-    test_ds = BatteryCTPolarSelectedSamplesDataset(args.index, args.geometry, samples=test_samples)
+    val_ds = BatteryCTPolarSelectedSamplesDataset(
+        args.index, args.geometry, samples=val_samples, use_radial_map=use_radial)
+    test_ds = BatteryCTPolarSelectedSamplesDataset(
+        args.index, args.geometry, samples=test_samples, use_radial_map=use_radial)
 
     if int(args.max_pictures) <= 0 and int(args.epochs) <= 0:
         args.epochs = int(args.slices_per_cell)

@@ -256,6 +256,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--splits",   default=os.path.join("CT_scan_model", "splits.json"),
                    help="splits.json (only used with --mask-from-cell).")
 
+    p.add_argument("--no-radial-map", action="store_true",
+                   help="Zero the radial-map channel. Must match how the --ckpt was trained "
+                        "(set --no-radial-map for a checkpoint trained with --no-radial-map).")
+
     # Sampler
     p.add_argument("--sampler",     choices=["ddpm", "ddim"], default="ddpm")
     p.add_argument("--ddim-steps",  type=int,   default=200, help="DDIM steps (only with --sampler=ddim)")
@@ -401,6 +405,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         mask       = _build_mask(      int(args.n), N_r, N_theta, r_valid_row, device)
         radial_map = _build_radial_map(int(args.n), N_r, N_theta, r_valid_row, device)
 
+    if bool(args.no_radial_map):
+        # A/B ablation: zero the radial channel (must match how --ckpt was trained).
+        radial_map = torch.zeros_like(radial_map)
+
     # --- Sample ---
     print(f"Sampling {args.n} image(s) with {args.sampler.upper()}...")
     if args.sampler == "ddim":
@@ -467,6 +475,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         "r_valid_row": r_valid_row,
         "cart_size": cart_size,
         "mask_from_cell": bool(args.mask_from_cell),
+        "no_radial_map": bool(args.no_radial_map),
         "mask_cell_id": used_cell_id,
         "conditions": {
             "cell_format": cell_format,

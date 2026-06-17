@@ -198,13 +198,19 @@ def _build_sample_tensor(
     N_r: int,
     N_theta: int,
     pad_value: float,
+    use_radial_map: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, float]:
     """Convert an original-resolution greyscale image to a polar tensor.
+
+    ``use_radial_map=False`` zeroes the radial-map channel (ch2), which — because
+    the first conv is bias-free — is functionally equivalent to a 2-channel model
+    while keeping the tensor shape (and checkpoints) at 3 channels. Used for the
+    radial-map A/B ablation.
 
     Returns
     -------
     x             : float32 [3, N_r, N_theta]
-                      ch0 = polar image, ch1 = binary mask, ch2 = radial map
+                      ch0 = polar image, ch1 = binary mask, ch2 = radial map (0 if disabled)
     mask          : float32 [N_r, N_theta]  (1 inside boundary, 0 outside)
     region_labels : float32 [N_r, N_theta]  (0=padding, 1=mandrel, 2=layers, 3=housing)
     r_max         : float — per-cell radial scale in original image pixels
@@ -224,6 +230,8 @@ def _build_sample_tensor(
     # Radial map: normalised row index inside cell, 0 outside
     row_idx    = np.arange(N_r, dtype=np.float32) / max(1.0, float(N_r - 1))
     radial_map = row_idx[:, np.newaxis] * np.ones((1, N_theta), dtype=np.float32) * padding_mask
+    if not use_radial_map:
+        radial_map = np.zeros_like(radial_map)   # A/B: disable radial conditioning
 
     # Region labels (3-class partition) for the per-region normalised losses
     r_scale = r_max / max(1.0, float(N_r - 1))
@@ -297,6 +305,7 @@ class BatteryCTPolarPerCellDataset(Dataset):
         batch_size: int,
         seed: int = 42,
         pad_to_batch: bool = True,
+        use_radial_map: bool = True,
     ) -> None:
         if split not in {"train", "val", "test"}:
             raise ValueError("split must be one of: train/val/test")
@@ -312,6 +321,7 @@ class BatteryCTPolarPerCellDataset(Dataset):
         self.N_r = int(getattr(project_config, "POLAR_N_R", 512))
         self.N_theta = int(getattr(project_config, "POLAR_N_THETA", 1024))
         self.pad_value = float(getattr(project_config, "POLAR_PAD_VALUE", -2.0))
+        self.use_radial_map = bool(use_radial_map)
         self.seed = int(seed)
         self._epoch = 1
 
@@ -365,6 +375,7 @@ class BatteryCTPolarPerCellDataset(Dataset):
         x, mask_t, labels_t, r_max = _build_sample_tensor(
             gray, cx, cy, r_valid_per_angle,
             self.N_r, self.N_theta, self.pad_value,
+            use_radial_map=self.use_radial_map,
         )
         cat, cont = _build_conditioning(g, r_max, image_half_size, slice_depth_relative)
         return x, (cat, cont), mask_t, labels_t
@@ -376,7 +387,8 @@ class BatteryCTPolarSelectedSamplesDataset(Dataset):
     Mirrors BatteryCTSelectedSamplesDataset.
     """
 
-    def __init__(self, index_json: str, geometry_json: str, samples: List[dict]) -> None:
+    def __init__(self, index_json: str, geometry_json: str, samples: List[dict],
+                 use_radial_map: bool = True) -> None:
         with open(index_json, "r", encoding="utf-8") as f:
             self.index = json.load(f)
         with open(geometry_json, "r", encoding="utf-8") as f:
@@ -386,6 +398,7 @@ class BatteryCTPolarSelectedSamplesDataset(Dataset):
         self.N_r = int(getattr(project_config, "POLAR_N_R", 512))
         self.N_theta = int(getattr(project_config, "POLAR_N_THETA", 1024))
         self.pad_value = float(getattr(project_config, "POLAR_PAD_VALUE", -2.0))
+        self.use_radial_map = bool(use_radial_map)
 
         self.samples = list(samples)
         if not self.samples:
@@ -410,6 +423,7 @@ class BatteryCTPolarSelectedSamplesDataset(Dataset):
         x, mask_t, labels_t, r_max = _build_sample_tensor(
             gray, cx, cy, r_valid_per_angle,
             self.N_r, self.N_theta, self.pad_value,
+            use_radial_map=self.use_radial_map,
         )
         cat, cont = _build_conditioning(g, r_max, image_half_size, slice_depth_relative)
         return x, (cat, cont), mask_t, labels_t
@@ -429,6 +443,7 @@ class BatteryCTPolarUniformCellsMaxPicturesDataset(Dataset):
         split: str,
         max_pictures: int,
         seed: int = 42,
+        use_radial_map: bool = True,
     ) -> None:
         if split not in {"train", "val", "test"}:
             raise ValueError("split must be one of: train/val/test")
@@ -445,6 +460,7 @@ class BatteryCTPolarUniformCellsMaxPicturesDataset(Dataset):
         self.base_path = self.index["base_path"]
         self.N_r = int(getattr(project_config, "POLAR_N_R", 512))
         self.N_theta = int(getattr(project_config, "POLAR_N_THETA", 1024))
+        self.use_radial_map = bool(use_radial_map)
         self.pad_value = float(getattr(project_config, "POLAR_PAD_VALUE", -2.0))
         self.seed = int(seed)
         self.max_pictures = int(max_pictures)
@@ -507,6 +523,7 @@ class BatteryCTPolarUniformCellsMaxPicturesDataset(Dataset):
         x, mask_t, labels_t, r_max = _build_sample_tensor(
             gray, cx, cy, r_valid_per_angle,
             self.N_r, self.N_theta, self.pad_value,
+            use_radial_map=self.use_radial_map,
         )
         cat, cont = _build_conditioning(g, r_max, image_half_size, slice_depth_relative)
         return x, (cat, cont), mask_t, labels_t
