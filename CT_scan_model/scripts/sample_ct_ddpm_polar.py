@@ -85,6 +85,17 @@ def _to_uint8_np(img: np.ndarray) -> np.ndarray:
     return np.clip((img + 1.0) * 0.5 * 255.0, 0, 255).astype(np.uint8)
 
 
+# Background value used purely for DISPLAY (padding -> black instead of grey).
+DISPLAY_BG_VALUE = -1.0   # -1 maps to uint8 0 (black)
+
+
+def _polar_black_bg(polar_np: np.ndarray, mask_np: np.ndarray) -> np.ndarray:
+    """Set padding (mask <= 0.5) to DISPLAY_BG_VALUE so the saved image has a
+    black background instead of the grey pad_value. Display-only — does not
+    touch the diffusion/training pad_value."""
+    return np.where(mask_np > 0.5, polar_np, DISPLAY_BG_VALUE).astype(np.float32)
+
+
 # ---------------------------------------------------------------------------
 # Sampling
 # ---------------------------------------------------------------------------
@@ -135,7 +146,7 @@ def _sample_ddpm(
         radial_map = _build_radial_map(n, N_r, N_theta, r_valid_row, device)
 
     x = torch.randn((n, 1, N_r, N_theta), device=device)
-    x[:, :, r_valid_row:, :] = pad_value
+    x = torch.where(mask > 0.5, x, torch.full_like(x, pad_value))
 
     for i in reversed(range(1, diffusion.noise_steps)):
         t = torch.full((n,), i, device=device, dtype=torch.long)
@@ -167,7 +178,7 @@ def _sample_ddpm(
                 * (x - ((1 - alpha) / torch.sqrt(1 - alpha_hat)) * pred)
                 + torch.sqrt(beta) * noise
             )
-        x[:, :, r_valid_row:, :] = pad_value
+        x = torch.where(mask > 0.5, x, torch.full_like(x, pad_value))
 
     return x   # [n, 1, N_r, N_theta] — only the image channel
 
@@ -206,7 +217,7 @@ def _sample_ddim(
         seq.append(diffusion.noise_steps - 1)
 
     x = torch.randn((n, 1, N_r, N_theta), device=device)
-    x[:, :, r_valid_row:, :] = pad_value
+    x = torch.where(mask > 0.5, x, torch.full_like(x, pad_value))
 
     for si in range(len(seq) - 1, 0, -1):
         t_i    = seq[si]
@@ -240,7 +251,7 @@ def _sample_ddim(
             + torch.sqrt(torch.clamp(1.0 - alpha_hat_s - sigma ** 2, min=0.0)) * eps
             + sigma * noise
         )
-        x[:, :, r_valid_row:, :] = pad_value
+        x = torch.where(mask > 0.5, x, torch.full_like(x, pad_value))
 
     return x   # [n, 1, N_r, N_theta] — only the image channel
 
@@ -473,16 +484,19 @@ def main(argv: Optional[List[str]] = None) -> int:
     cx = cy = float(cart_size) / 2.0
     r_max = float(r_valid_rel_used) * cx  # scale for back-projection
 
+    mask_np_all = mask[:, 0].cpu().numpy()  # [n, N_r, N_theta]
     for i in range(int(args.n)):
         polar_np = samples_np[i]  # [N_r, N_theta]
+        # Render padding as black (display only).
+        polar_disp = _polar_black_bg(polar_np, mask_np_all[i])
 
         # Save polar image.
-        polar_u8 = _to_uint8_np(np.clip(polar_np, -1.0, 1.0))
+        polar_u8 = _to_uint8_np(np.clip(polar_disp, -1.0, 1.0))
         polar_path = os.path.join(args.outdir, f"sample_{i:03d}_polar.png")
         cv2.imwrite(polar_path, polar_u8)
 
-        # Back-project to cartesian.
-        cart_np = polar_to_cart(polar_np, cx, cy, r_max, N_r, N_theta, cart_size, pad_value)
+        # Back-project to cartesian (black background outside the cell, too).
+        cart_np = polar_to_cart(polar_disp, cx, cy, r_max, N_r, N_theta, cart_size, DISPLAY_BG_VALUE)
         cart_u8 = _to_uint8_np(np.clip(cart_np, -1.0, 1.0))
         cart_path = os.path.join(args.outdir, f"sample_{i:03d}_cart.png")
         cv2.imwrite(cart_path, cart_u8)
