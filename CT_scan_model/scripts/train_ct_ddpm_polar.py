@@ -379,7 +379,7 @@ def main(argv: Optional[list] = None) -> int:
     p.add_argument("--slices-per-cell", type=int, default=1)
     p.add_argument("--epochs", type=int, default=1000)
     p.add_argument("--batch-size", type=int, default=8)
-    p.add_argument("--lr", type=float, default=2e-4)
+    p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--accumulation-steps", type=int, default=1)
     p.add_argument("--num-workers", type=int, default=0)
 
@@ -395,7 +395,7 @@ def main(argv: Optional[list] = None) -> int:
     p.add_argument("--beta-start", type=float, default=1e-4)
     p.add_argument("--beta-end", type=float, default=0.02)
 
-    p.add_argument("--ema-beta", type=float, default=0.995,
+    p.add_argument("--ema-beta", type=float, default=0.999,
                    help="EMA decay (V6 value 0.995). Higher = smoother/more stable EMA model "
                         "for the qualitative samples.")
     p.add_argument("--p-uncond", type=float, default=0.1)
@@ -407,7 +407,7 @@ def main(argv: Optional[list] = None) -> int:
     p.add_argument("--lambda-gehaeuse", type=float, default=1.0,
                    help="λ for the per-region-normalised housing/can MSE term.")
 
-    p.add_argument("--prediction-type", choices=["eps", "v"], default="eps",
+    p.add_argument("--prediction-type", choices=["eps", "v"], default="v",
                    help="Model target: 'eps' (noise) or 'v' (velocity, Salimans & Ho). "
                         "v makes the high-t target contain x0 -> better global brightness. "
                         "Must match between training and sampling.")
@@ -415,7 +415,7 @@ def main(argv: Optional[list] = None) -> int:
                    help="Rescale the schedule so alpha_hat[-1]=0 (Lin et al.) -> the terminal "
                         "step is pure noise, removing the brightness train/test mismatch. "
                         "Requires --prediction-type v. Must match between training and sampling.")
-    p.add_argument("--loss-type", choices=["global", "region"], default="region",
+    p.add_argument("--loss-type", choices=["global", "region"], default="global",
                    help="'region': only the per-region terms (λ_m/λ_l/λ_h). "
                         "'global': HYBRID = an area-weighted global MSE term (λ_global) PLUS "
                         "the per-region terms — the global term damps the brightness oscillation.")
@@ -424,7 +424,7 @@ def main(argv: Optional[list] = None) -> int:
     p.add_argument("--offset-noise", type=float, default=0.0,
                    help="Offset-noise strength c (0 = off, ~0.1 = on). Adds a per-image DC offset "
                         "to the training noise so the model learns the global brightness.")
-    p.add_argument("--lambda-grad", type=float, default=0.0,
+    p.add_argument("--lambda-grad", type=float, default=1.0,
                    help="Max weight of the gradient (edge-sharpness) loss (0 = off). Penalises "
                         "blurred spatial gradients of the reconstructed x0 vs the true x0, "
                         "weighted by ᾱ_t over t (acts mainly at low noise). Fixes oversmoothed "
@@ -451,10 +451,10 @@ def main(argv: Optional[list] = None) -> int:
 
     p.add_argument("--sample-every", type=int, default=10)
     p.add_argument("--sample-n", type=int, default=1)
-    p.add_argument("--val-pictures-every", type=int, default=1,
+    p.add_argument("--val-pictures-every", type=int, default=0,
                    help="Save the ground-truth val_pictures every N epochs (0 = disable). "
                         "These are static reference images; >1 avoids redundant re-saving.")
-    p.add_argument("--grad-plot-every", type=int, default=0,
+    p.add_argument("--grad-plot-every", type=int, default=5,
                    help="Save a gradient-loss diagnostic figure (x_t, x0, x0_hat and their "
                         "gradients) every N epochs (0 = disable). Requires matplotlib.")
     p.add_argument("--sample-cfg-scale", type=float, default=1.0)
