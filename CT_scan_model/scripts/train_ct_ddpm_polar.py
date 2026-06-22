@@ -33,6 +33,7 @@ import warnings
 import sys
 from typing import Optional
 
+import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
@@ -46,6 +47,14 @@ try:
     from tqdm import tqdm  # type: ignore
 except Exception:  # pragma: no cover
     tqdm = None
+
+try:
+    import matplotlib  # type: ignore
+    matplotlib.use("Agg")  # headless / cluster — no display
+    import matplotlib.pyplot as plt  # type: ignore
+    HAS_MPL = True
+except Exception:  # pragma: no cover
+    HAS_MPL = False
 
 import math
 
@@ -176,6 +185,92 @@ def region_mse_loss(
     return total, per_region
 
 
+def gradient_loss(x0_pred: torch.Tensor, x0_true: torch.Tensor,
+                  mask: torch.Tensor, alpha_hat_bchw: torch.Tensor) -> torch.Tensor:
+    """ᾱ_t-weighted, masked MSE between the spatial gradients of x0_pred and x0_true.
+
+    Finite differences in r (rows) and θ (cols). The adjacency mask counts a
+    gradient only where BOTH neighbouring pixels are valid → the cell↔padding
+    boundary is excluded automatically. ``alpha_hat_bchw`` ([B,1,1,1]) weights
+    each sample by its signal fraction ᾱ_t (≈0 at high noise, where x0_pred is
+    unreliable; ≈1 at low noise).
+    """
+    x0_pred = x0_pred.float(); x0_true = x0_true.float()
+    mask = mask.float(); a = alpha_hat_bchw.float()
+
+    drp = x0_pred[:, :, 1:, :] - x0_pred[:, :, :-1, :]
+    drt = x0_true[:, :, 1:, :] - x0_true[:, :, :-1, :]
+    mr  = mask[:, :, 1:, :] * mask[:, :, :-1, :]
+
+    dcp = x0_pred[:, :, :, 1:] - x0_pred[:, :, :, :-1]
+    dct = x0_true[:, :, :, 1:] - x0_true[:, :, :, :-1]
+    mc  = mask[:, :, :, 1:] * mask[:, :, :, :-1]
+
+    num = (a * mr * (drp - drt) ** 2).sum() + (a * mc * (dcp - dct) ** 2).sum()
+    den = (mr.sum() + mc.sum()).clamp_min(1.0)
+    return num / den
+
+
+def grad_loss_term(pred: torch.Tensor, x: torch.Tensor, x_t: torch.Tensor,
+                   t: torch.Tensor, labels: torch.Tensor, diffusion: Diffusion,
+                   prediction_type: str, lam_grad: float) -> torch.Tensor:
+    """λ_grad · ᾱ_t · gradient_loss(x̂0, x0), masked to the cell. 0 if λ_grad<=0.
+
+    Reconstructs x̂0 from the model output (v or eps), compares its spatial
+    gradients to the true x0's, weighted by ᾱ_t over t (sharpness is learned at
+    low noise, where x̂0 is meaningful).
+    """
+    if float(lam_grad) <= 0.0:
+        return pred.new_zeros(())
+    x_t_img = x_t[:, :1]
+    x0_true = x[:, :1]
+    if prediction_type == "v":
+        x0_pred = diffusion.v_to_x0(x_t_img.float(), pred.float(), t)
+    else:
+        a_sqrt = torch.sqrt(diffusion.alpha_hat[t])[:, None, None, None].float()
+        s = torch.sqrt(1.0 - diffusion.alpha_hat[t])[:, None, None, None].float()
+        x0_pred = (x_t_img.float() - s * pred.float()) / a_sqrt.clamp_min(1e-8)
+    a = diffusion.alpha_hat[t][:, None, None, None]
+    m = labels if labels.dim() == 4 else labels[:, None]
+    m = (m > 0)
+    return float(lam_grad) * gradient_loss(x0_pred, x0_true, m, a)
+
+
+def _save_grad_plot(path: str, x_t: np.ndarray, x0: np.ndarray, x0_hat: np.ndarray,
+                    mask: np.ndarray, t_val: int) -> None:
+    """Diagnostic figure for the gradient loss (polar space, one sample):
+      row 1 (spanning both cols): noised input x_t
+      row 2: x0 (true)        | x0_hat (reconstructed)
+      row 3: |grad x0|        | |grad x0_hat|
+    """
+    def _grad_mag(img: np.ndarray) -> np.ndarray:
+        dr = np.zeros_like(img); dc = np.zeros_like(img)
+        dr[:-1, :] = img[1:, :] - img[:-1, :]
+        dc[:, :-1] = img[:, 1:] - img[:, :-1]
+        return np.sqrt(dr * dr + dc * dc)
+
+    m = (mask > 0.5).astype(np.float32)
+    g0 = _grad_mag(x0) * m
+    gh = _grad_mag(x0_hat) * m
+    gmax = float(max(g0.max(), gh.max(), 1e-6))
+
+    fig = plt.figure(figsize=(12, 13))
+    gs = fig.add_gridspec(3, 2)
+    ax = fig.add_subplot(gs[0, :]); ax.imshow(x_t, cmap="gray", vmin=-1, vmax=1, aspect="auto")
+    ax.set_title(f"x_t  (noised input, t={t_val})"); ax.axis("off")
+    ax = fig.add_subplot(gs[1, 0]); ax.imshow(x0, cmap="gray", vmin=-1, vmax=1, aspect="auto")
+    ax.set_title("x0  (true)"); ax.axis("off")
+    ax = fig.add_subplot(gs[1, 1]); ax.imshow(x0_hat, cmap="gray", vmin=-1, vmax=1, aspect="auto")
+    ax.set_title("x0_hat  (reconstructed)"); ax.axis("off")
+    ax = fig.add_subplot(gs[2, 0]); ax.imshow(g0, cmap="inferno", vmin=0, vmax=gmax, aspect="auto")
+    ax.set_title("|grad x0|"); ax.axis("off")
+    ax = fig.add_subplot(gs[2, 1]); ax.imshow(gh, cmap="inferno", vmin=0, vmax=gmax, aspect="auto")
+    ax.set_title("|grad x0_hat|"); ax.axis("off")
+    fig.tight_layout()
+    fig.savefig(path, dpi=100)
+    plt.close(fig)
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -234,6 +329,7 @@ def run_eval(
     lam_global: float = 0.0,
     prediction_type: str = "eps",
     offset_noise: float = 0.0,
+    lam_grad: float = 0.0,
 ):
     """Returns (total_loss, {"mandrel","layers","housing","global"}) — all means."""
     net = ema_model if use_ema else model
@@ -259,6 +355,8 @@ def run_eval(
             loss_t, per_region = region_mse_loss(
                 pred, target, labels, lam_mandrel, lam_layers, lam_housing, lam_global,
             )
+            loss_t = loss_t + grad_loss_term(
+                pred, x, x_t, t, labels, diffusion, prediction_type, lam_grad)
             total += float(loss_t.item()) * bs
             for k in reg_acc:
                 reg_acc[k] += float(per_region[k].item()) * bs
@@ -326,6 +424,11 @@ def main(argv: Optional[list] = None) -> int:
     p.add_argument("--offset-noise", type=float, default=0.0,
                    help="Offset-noise strength c (0 = off, ~0.1 = on). Adds a per-image DC offset "
                         "to the training noise so the model learns the global brightness.")
+    p.add_argument("--lambda-grad", type=float, default=0.0,
+                   help="Max weight of the gradient (edge-sharpness) loss (0 = off). Penalises "
+                        "blurred spatial gradients of the reconstructed x0 vs the true x0, "
+                        "weighted by ᾱ_t over t (acts mainly at low noise). Fixes oversmoothed "
+                        "thin/thick layers, stripe edges and tab corners.")
 
     p.add_argument("--no-radial-map", action="store_true",
                    help="A/B ablation: zero the radial-map conditioning channel (ch2). "
@@ -348,6 +451,12 @@ def main(argv: Optional[list] = None) -> int:
 
     p.add_argument("--sample-every", type=int, default=10)
     p.add_argument("--sample-n", type=int, default=1)
+    p.add_argument("--val-pictures-every", type=int, default=1,
+                   help="Save the ground-truth val_pictures every N epochs (0 = disable). "
+                        "These are static reference images; >1 avoids redundant re-saving.")
+    p.add_argument("--grad-plot-every", type=int, default=0,
+                   help="Save a gradient-loss diagnostic figure (x_t, x0, x0_hat and their "
+                        "gradients) every N epochs (0 = disable). Requires matplotlib.")
     p.add_argument("--sample-cfg-scale", type=float, default=1.0)
     p.add_argument("--sample-sampler", choices=["ddpm", "ddim"], default="ddpm",
                    help="Sampler used for qualitative samples during training")
@@ -367,6 +476,7 @@ def main(argv: Optional[list] = None) -> int:
     lam_g = float(args.lambda_global) if str(args.loss_type) == "global" else 0.0
     pred_type = str(args.prediction_type)
     offset_noise = float(args.offset_noise)
+    lam_grad = float(args.lambda_grad)
     use_radial = not bool(args.no_radial_map)   # radial-map A/B ablation
     if bool(args.zero_terminal_snr) and pred_type != "v":
         raise SystemExit("--zero-terminal-snr requires --prediction-type v "
@@ -624,6 +734,8 @@ def main(argv: Optional[list] = None) -> int:
                     target = diffusion.get_v(x[:, :1], noise, t) if pred_type == "v" else noise
                     loss_raw, region_mse = region_mse_loss(
                         pred, target, labels, lam_m, lam_l, lam_h, lam_g)
+                    loss_raw = loss_raw + grad_loss_term(
+                        pred, x, x_t, t, labels, diffusion, pred_type, lam_grad)
                     loss = loss_raw / max(1, int(args.accumulation_steps))
 
                 scaler.scale(loss).backward()
@@ -659,7 +771,7 @@ def main(argv: Optional[list] = None) -> int:
                 val_loader, model, ema_model, diffusion, device,
                 use_ema=(not bool(args.no_ema_val)),
                 lam_mandrel=lam_m, lam_layers=lam_l, lam_housing=lam_h, lam_global=lam_g,
-                prediction_type=pred_type, offset_noise=offset_noise,
+                prediction_type=pred_type, offset_noise=offset_noise, lam_grad=lam_grad,
             )
             print(f"Epoch {epoch:04d} | train={train_loss:.6f} | "
                   f"val={'ema' if not args.no_ema_val else 'raw'}={val_loss:.6f} | "
@@ -669,26 +781,28 @@ def main(argv: Optional[list] = None) -> int:
                 clearml_logger.report_scalar("loss_epoch", "train", iteration=epoch, value=float(train_loss))
                 clearml_logger.report_scalar("loss_epoch", "val", iteration=epoch, value=float(val_loss))
 
-            # Save ground-truth polar images and back-projected cartesian images.
-            if cv2 is not None:
+            # Save ground-truth polar/cartesian reference images (black background).
+            if (cv2 is not None and int(args.val_pictures_every) > 0
+                    and (epoch % int(args.val_pictures_every) == 0)):
                 try:
                     with torch.no_grad():
                         for j, val_batch in enumerate(val_loader):
                             vx, vcond = val_batch[0], val_batch[1]
                             polar_imgs = vx[:, 0].cpu().numpy()
+                            mask_imgs  = vx[:, 1].cpu().numpy()
                             _, vcont = vcond
                             for k in range(polar_imgs.shape[0]):
                                 r_valid_rel_k = float(vcont[k, 1].item())
-                                # Save polar image directly.
-                                polar_u8 = ((polar_imgs[k] + 1.0) * 0.5 * 255.0).clip(0, 255).astype("uint8")
+                                polar_disp = _polar_black_bg(polar_imgs[k], mask_imgs[k])
+                                # Save polar image (black background).
                                 cv2.imwrite(
                                     os.path.join(val_pictures_dir, f"ep{epoch:04d}_val{j:02d}_{k:02d}_polar.png"),
-                                    polar_u8,
+                                    _to_uint8_np(polar_disp),
                                 )
-                                # Save back-projected cartesian image.
+                                # Save back-projected cartesian image (black background).
                                 cart_u8 = _polar_sample_to_uint8_cart(
-                                    torch.from_numpy(polar_imgs[k]), r_valid_rel_k,
-                                    cart_size, N_r, N_theta, pad_value,
+                                    torch.from_numpy(polar_disp), r_valid_rel_k,
+                                    cart_size, N_r, N_theta, DISPLAY_BG_VALUE,
                                 )
                                 cv2.imwrite(
                                     os.path.join(val_pictures_dir, f"ep{epoch:04d}_val{j:02d}_{k:02d}_cart.png"),
@@ -788,6 +902,40 @@ def main(argv: Optional[list] = None) -> int:
                         print(f"[WARNING] Qualitative sampling failed: {e}")
                         traceback.print_exc()
 
+            # Gradient-loss diagnostic figure (x_t, x0, x0_hat + their gradients).
+            if (HAS_MPL and int(args.grad_plot_every) > 0
+                    and (epoch % int(args.grad_plot_every) == 0)):
+                try:
+                    grad_dir = os.path.join(run_dir, "grad_plots")
+                    os.makedirs(grad_dir, exist_ok=True)
+                    t_plot = max(1, int(args.noise_steps) // 10)
+                    with torch.no_grad():
+                        vb = next(iter(val_loader))
+                        vx = vb[0][:1].to(device)            # one sample [1, 3, H, W]
+                        cat_v, cont_v = vb[1]
+                        cond_v = (cat_v[:1].to(device), cont_v[:1].to(device))
+                        t_fixed = torch.full((1,), t_plot, device=device, dtype=torch.long)
+                        x_t, _ = diffusion.noise_images(vx, t_fixed, offset_noise=offset_noise)
+                        pred = model(x_t, t_fixed, cond_v)
+                        if pred_type == "v":
+                            x0_hat = diffusion.v_to_x0(x_t[:, :1].float(), pred.float(), t_fixed)
+                        else:
+                            a_sqrt = torch.sqrt(diffusion.alpha_hat[t_fixed])[:, None, None, None].float()
+                            s = torch.sqrt(1.0 - diffusion.alpha_hat[t_fixed])[:, None, None, None].float()
+                            x0_hat = (x_t[:, :1].float() - s * pred.float()) / a_sqrt.clamp_min(1e-8)
+                    _save_grad_plot(
+                        os.path.join(grad_dir, f"ep{epoch:04d}_t{t_plot}.png"),
+                        x_t[0, 0].cpu().numpy(),       # noised input
+                        vx[0, 0].cpu().numpy(),        # x0 (true)
+                        x0_hat[0, 0].cpu().numpy(),    # x0_hat
+                        vx[0, 1].cpu().numpy(),        # mask channel
+                        t_plot,
+                    )
+                except Exception as e:
+                    import traceback
+                    print(f"[WARNING] grad plot failed: {e}")
+                    traceback.print_exc()
+
             if val_loss < best_val:
                 best_val = val_loss
                 epochs_no_improve = 0
@@ -881,6 +1029,8 @@ def main(argv: Optional[list] = None) -> int:
                 target = diffusion.get_v(x[:, :1], noise, t) if pred_type == "v" else noise
                 loss_raw, _ = region_mse_loss(
                     pred, target, labels, lam_m, lam_l, lam_h, lam_g)
+                loss_raw = loss_raw + grad_loss_term(
+                    pred, x, x_t, t, labels, diffusion, pred_type, lam_grad)
                 loss = loss_raw / max(1, int(args.accumulation_steps))
 
             scaler.scale(loss).backward()
@@ -909,7 +1059,8 @@ def main(argv: Optional[list] = None) -> int:
                     val_loss, _ = run_eval(val_loader, model, ema_model, diffusion, device,
                                    use_ema=(not bool(args.no_ema_val)),
                                    lam_mandrel=lam_m, lam_layers=lam_l, lam_housing=lam_h,
-                                   lam_global=lam_g, prediction_type=pred_type, offset_noise=offset_noise)
+                                   lam_global=lam_g, prediction_type=pred_type, offset_noise=offset_noise,
+                                   lam_grad=lam_grad)
                     last_val_loss = float(val_loss)
                     if val_loss < best_val:
                         best_val = float(val_loss)
@@ -932,7 +1083,8 @@ def main(argv: Optional[list] = None) -> int:
             val_loss, _ = run_eval(val_loader, model, ema_model, diffusion, device,
                                    use_ema=(not bool(args.no_ema_val)),
                                    lam_mandrel=lam_m, lam_layers=lam_l, lam_housing=lam_h,
-                                   lam_global=lam_g, prediction_type=pred_type, offset_noise=offset_noise)
+                                   lam_global=lam_g, prediction_type=pred_type, offset_noise=offset_noise,
+                                   lam_grad=lam_grad)
             last_val_loss = float(val_loss)
             if val_loss < best_val:
                 best_val = float(val_loss)
@@ -962,7 +1114,7 @@ def main(argv: Optional[list] = None) -> int:
     test_loss, test_region = run_eval(
         test_loader, model, ema_model, diffusion, device, use_ema=use_ema_val,
         lam_mandrel=lam_m, lam_layers=lam_l, lam_housing=lam_h, lam_global=lam_g,
-        prediction_type=pred_type, offset_noise=offset_noise,
+        prediction_type=pred_type, offset_noise=offset_noise, lam_grad=lam_grad,
     )
     with open(os.path.join(run_dir, "final_metrics.json"), "w", encoding="utf-8") as f:
         json.dump({
