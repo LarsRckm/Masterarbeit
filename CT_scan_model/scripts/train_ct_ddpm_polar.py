@@ -211,14 +211,50 @@ def gradient_loss(x0_pred: torch.Tensor, x0_true: torch.Tensor,
     return num / den
 
 
+def _grad_t_weight(alpha_hat_bchw: torch.Tensor, mode: str) -> torch.Tensor:
+    """Per-sample t-weight for the gradient/structure loss, as a function of ᾱ_t.
+
+    ᾱ_t ∈ [0,1] is the signal fraction (≈1 at low noise / small t, ≈0 at high
+    noise / large t). The modes trade off WHERE over t the structure loss acts:
+
+      "alpha"   w = ᾱ_t              — current: emphasis on LOW t (fine detail).
+      "flat"    w = 1                — uniform over all t.
+      "mid"     w = 4·ᾱ_t·(1−ᾱ_t)    — symmetric tent, peak at mid t (ᾱ_t=0.5);
+                                       NOTE: discards low t (w→0 at ᾱ_t=1).
+      "plateau" w = 4·m·(1−m), m=min(ᾱ_t,0.5)
+                                     — w=1 for ᾱ_t≥0.5 (low/mid t), then parabolic
+                                       decay toward high t. Keeps the fine detail
+                                       AND adds the mid-t structural regime, only
+                                       damping the (ill-posed) high-t end.
+      "high"    w = 1−ᾱ_t            — emphasis on HIGH t; ill-posed for the x̂0
+                                       gradient loss (x̂0 is blurry there) — use with care.
+    """
+    a = alpha_hat_bchw
+    if mode == "alpha":
+        return a
+    if mode == "flat":
+        return torch.ones_like(a)
+    if mode == "mid":
+        return 4.0 * a * (1.0 - a)
+    if mode == "plateau":
+        m = a.clamp(max=0.5)
+        return 4.0 * m * (1.0 - m)
+    if mode == "high":
+        return 1.0 - a
+    raise ValueError(f"unknown grad t_weighting: {mode!r} "
+                     "(expected alpha/flat/mid/plateau/high)")
+
+
 def grad_loss_term(pred: torch.Tensor, x: torch.Tensor, x_t: torch.Tensor,
                    t: torch.Tensor, labels: torch.Tensor, diffusion: Diffusion,
-                   prediction_type: str, lam_grad: float) -> torch.Tensor:
-    """λ_grad · ᾱ_t · gradient_loss(x̂0, x0), masked to the cell. 0 if λ_grad<=0.
+                   prediction_type: str, lam_grad: float,
+                   t_weighting: str = "alpha") -> torch.Tensor:
+    """λ_grad · w(ᾱ_t) · gradient_loss(x̂0, x0), masked to the cell. 0 if λ_grad<=0.
 
     Reconstructs x̂0 from the model output (v or eps), compares its spatial
-    gradients to the true x0's, weighted by ᾱ_t over t (sharpness is learned at
-    low noise, where x̂0 is meaningful).
+    gradients to the true x0's, weighted over t by ``t_weighting`` (see
+    _grad_t_weight): "alpha" acts at low noise, "plateau"/"mid" shift weight into
+    the mid-t structural regime.
     """
     if float(lam_grad) <= 0.0:
         return pred.new_zeros(())
@@ -230,10 +266,11 @@ def grad_loss_term(pred: torch.Tensor, x: torch.Tensor, x_t: torch.Tensor,
         a_sqrt = torch.sqrt(diffusion.alpha_hat[t])[:, None, None, None].float()
         s = torch.sqrt(1.0 - diffusion.alpha_hat[t])[:, None, None, None].float()
         x0_pred = (x_t_img.float() - s * pred.float()) / a_sqrt.clamp_min(1e-8)
-    a = diffusion.alpha_hat[t][:, None, None, None]
+    a = diffusion.alpha_hat[t][:, None, None, None].float()
+    w = _grad_t_weight(a, t_weighting)
     m = labels if labels.dim() == 4 else labels[:, None]
     m = (m > 0)
-    return float(lam_grad) * gradient_loss(x0_pred, x0_true, m, a)
+    return float(lam_grad) * gradient_loss(x0_pred, x0_true, m, w)
 
 
 def _save_grad_plot(path: str, x_t: np.ndarray, x0: np.ndarray, x0_hat: np.ndarray,
@@ -330,6 +367,7 @@ def run_eval(
     prediction_type: str = "eps",
     offset_noise: float = 0.0,
     lam_grad: float = 0.0,
+    t_weighting: str = "alpha",
 ):
     """Returns (total_loss, {"mandrel","layers","housing","global"}) — all means."""
     net = ema_model if use_ema else model
@@ -356,7 +394,8 @@ def run_eval(
                 pred, target, labels, lam_mandrel, lam_layers, lam_housing, lam_global,
             )
             loss_t = loss_t + grad_loss_term(
-                pred, x, x_t, t, labels, diffusion, prediction_type, lam_grad)
+                pred, x, x_t, t, labels, diffusion, prediction_type, lam_grad,
+                t_weighting=t_weighting)
             total += float(loss_t.item()) * bs
             for k in reg_acc:
                 reg_acc[k] += float(per_region[k].item()) * bs
@@ -424,11 +463,20 @@ def main(argv: Optional[list] = None) -> int:
     p.add_argument("--offset-noise", type=float, default=0.0,
                    help="Offset-noise strength c (0 = off, ~0.1 = on). Adds a per-image DC offset "
                         "to the training noise so the model learns the global brightness.")
-    p.add_argument("--lambda-grad", type=float, default=1.0,
+    p.add_argument("--lambda-grad", type=float, default=0.7,
                    help="Max weight of the gradient (edge-sharpness) loss (0 = off). Penalises "
                         "blurred spatial gradients of the reconstructed x0 vs the true x0, "
-                        "weighted by ᾱ_t over t (acts mainly at low noise). Fixes oversmoothed "
+                        "weighted by w(ᾱ_t) over t (see --grad-t-weighting). Fixes oversmoothed "
                         "thin/thick layers, stripe edges and tab corners.")
+    p.add_argument("--grad-t-weighting", choices=["alpha", "flat", "mid", "plateau", "high"],
+                   default="plateau",
+                   help="t-weighting of the gradient/structure loss as a function of ᾱ_t. "
+                        "'alpha'(=ᾱ_t, default) acts at LOW noise (fine detail); "
+                        "'plateau'(w=1 until ᾱ=0.5, then parabolic decay) keeps fine detail AND "
+                        "adds the mid-t structural regime; 'mid'(symmetric tent) emphasises mid t "
+                        "but discards low t; 'flat' is uniform; 'high'(=1−ᾱ) emphasises high t "
+                        "(ill-posed for x̂0, use with care). NOTE: plateau/mid/flat raise the term's "
+                        "total magnitude vs 'alpha' (~2× for plateau) — reduce --lambda-grad accordingly.")
 
     p.add_argument("--no-radial-map", action="store_true",
                    help="A/B ablation: zero the radial-map conditioning channel (ch2). "
@@ -477,6 +525,7 @@ def main(argv: Optional[list] = None) -> int:
     pred_type = str(args.prediction_type)
     offset_noise = float(args.offset_noise)
     lam_grad = float(args.lambda_grad)
+    grad_tw = str(args.grad_t_weighting)
     use_radial = not bool(args.no_radial_map)   # radial-map A/B ablation
     if bool(args.zero_terminal_snr) and pred_type != "v":
         raise SystemExit("--zero-terminal-snr requires --prediction-type v "
@@ -735,7 +784,8 @@ def main(argv: Optional[list] = None) -> int:
                     loss_raw, region_mse = region_mse_loss(
                         pred, target, labels, lam_m, lam_l, lam_h, lam_g)
                     loss_raw = loss_raw + grad_loss_term(
-                        pred, x, x_t, t, labels, diffusion, pred_type, lam_grad)
+                        pred, x, x_t, t, labels, diffusion, pred_type, lam_grad,
+                        t_weighting=grad_tw)
                     loss = loss_raw / max(1, int(args.accumulation_steps))
 
                 scaler.scale(loss).backward()
@@ -772,6 +822,7 @@ def main(argv: Optional[list] = None) -> int:
                 use_ema=(not bool(args.no_ema_val)),
                 lam_mandrel=lam_m, lam_layers=lam_l, lam_housing=lam_h, lam_global=lam_g,
                 prediction_type=pred_type, offset_noise=offset_noise, lam_grad=lam_grad,
+                t_weighting=grad_tw,
             )
             print(f"Epoch {epoch:04d} | train={train_loss:.6f} | "
                   f"val={'ema' if not args.no_ema_val else 'raw'}={val_loss:.6f} | "
@@ -1030,7 +1081,8 @@ def main(argv: Optional[list] = None) -> int:
                 loss_raw, _ = region_mse_loss(
                     pred, target, labels, lam_m, lam_l, lam_h, lam_g)
                 loss_raw = loss_raw + grad_loss_term(
-                    pred, x, x_t, t, labels, diffusion, pred_type, lam_grad)
+                    pred, x, x_t, t, labels, diffusion, pred_type, lam_grad,
+                    t_weighting=grad_tw)
                 loss = loss_raw / max(1, int(args.accumulation_steps))
 
             scaler.scale(loss).backward()
@@ -1060,7 +1112,7 @@ def main(argv: Optional[list] = None) -> int:
                                    use_ema=(not bool(args.no_ema_val)),
                                    lam_mandrel=lam_m, lam_layers=lam_l, lam_housing=lam_h,
                                    lam_global=lam_g, prediction_type=pred_type, offset_noise=offset_noise,
-                                   lam_grad=lam_grad)
+                                   lam_grad=lam_grad, t_weighting=grad_tw)
                     last_val_loss = float(val_loss)
                     if val_loss < best_val:
                         best_val = float(val_loss)
@@ -1084,7 +1136,7 @@ def main(argv: Optional[list] = None) -> int:
                                    use_ema=(not bool(args.no_ema_val)),
                                    lam_mandrel=lam_m, lam_layers=lam_l, lam_housing=lam_h,
                                    lam_global=lam_g, prediction_type=pred_type, offset_noise=offset_noise,
-                                   lam_grad=lam_grad)
+                                   lam_grad=lam_grad, t_weighting=grad_tw)
             last_val_loss = float(val_loss)
             if val_loss < best_val:
                 best_val = float(val_loss)
@@ -1115,6 +1167,7 @@ def main(argv: Optional[list] = None) -> int:
         test_loader, model, ema_model, diffusion, device, use_ema=use_ema_val,
         lam_mandrel=lam_m, lam_layers=lam_l, lam_housing=lam_h, lam_global=lam_g,
         prediction_type=pred_type, offset_noise=offset_noise, lam_grad=lam_grad,
+        t_weighting=grad_tw,
     )
     with open(os.path.join(run_dir, "final_metrics.json"), "w", encoding="utf-8") as f:
         json.dump({

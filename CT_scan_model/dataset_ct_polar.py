@@ -364,21 +364,30 @@ class BatteryCTPolarPerCellDataset(Dataset):
         if not imgs:
             raise KeyError(f"No images indexed for cell_id: {cell_id}. Rebuild cell_index.json")
 
-        j = (self._epoch - 1) % len(imgs)
-        d = imgs[j]
-        img_path = os.path.join(self.base_path, d["relpath"])
-        slice_depth_relative = float(d.get("rel_depth", 0.0))
-
-        gray, cx, cy, r_valid_per_angle, image_half_size = _load_and_detect_boundary(
-            img_path, self.N_theta,
-        )
-        x, mask_t, labels_t, r_max = _build_sample_tensor(
-            gray, cx, cy, r_valid_per_angle,
-            self.N_r, self.N_theta, self.pad_value,
-            use_radial_map=self.use_radial_map,
-        )
-        cat, cont = _build_conditioning(g, r_max, image_half_size, slice_depth_relative)
-        return x, (cat, cont), mask_t, labels_t
+        n = len(imgs)
+        j_base = (self._epoch - 1) % n
+        for attempt in range(n):
+            j = (j_base + attempt) % n
+            d = imgs[j]
+            img_path = os.path.join(self.base_path, d["relpath"])
+            slice_depth_relative = float(d.get("rel_depth", 0.0))
+            try:
+                gray, cx, cy, r_valid_per_angle, image_half_size = _load_and_detect_boundary(
+                    img_path, self.N_theta,
+                )
+            except FileNotFoundError:
+                warnings.warn(f"[dataset] Image not found, skipping: {img_path}")
+                continue
+            x, mask_t, labels_t, r_max = _build_sample_tensor(
+                gray, cx, cy, r_valid_per_angle,
+                self.N_r, self.N_theta, self.pad_value,
+                use_radial_map=self.use_radial_map,
+            )
+            cat, cont = _build_conditioning(g, r_max, image_half_size, slice_depth_relative)
+            return x, (cat, cont), mask_t, labels_t
+        # All images for this cell are missing — fall back to the next cell in the index.
+        warnings.warn(f"[dataset] All {n} images missing for cell {cell_id!r}; trying next cell.")
+        return self.__getitem__((idx + 1) % len(self.cell_ids))
 
 
 class BatteryCTPolarSelectedSamplesDataset(Dataset):
@@ -408,25 +417,32 @@ class BatteryCTPolarSelectedSamplesDataset(Dataset):
         return len(self.samples)
 
     def __getitem__(self, idx: int):
-        d = self.samples[idx]
-        cell_id = d["cell_id"]
-        slice_depth_relative = float(d.get("rel_depth", 0.0))
+        n = len(self.samples)
+        for attempt in range(n):
+            d = self.samples[(idx + attempt) % n]
+            cell_id = d["cell_id"]
+            slice_depth_relative = float(d.get("rel_depth", 0.0))
 
-        g = self.geometry.get(cell_id)
-        if g is None:
-            raise KeyError(f"Missing geometry for cell_id: {cell_id}. Run precompute_geometry.py")
+            g = self.geometry.get(cell_id)
+            if g is None:
+                raise KeyError(f"Missing geometry for cell_id: {cell_id}. Run precompute_geometry.py")
 
-        img_path = os.path.join(self.base_path, d["relpath"])
-        gray, cx, cy, r_valid_per_angle, image_half_size = _load_and_detect_boundary(
-            img_path, self.N_theta,
-        )
-        x, mask_t, labels_t, r_max = _build_sample_tensor(
-            gray, cx, cy, r_valid_per_angle,
-            self.N_r, self.N_theta, self.pad_value,
-            use_radial_map=self.use_radial_map,
-        )
-        cat, cont = _build_conditioning(g, r_max, image_half_size, slice_depth_relative)
-        return x, (cat, cont), mask_t, labels_t
+            img_path = os.path.join(self.base_path, d["relpath"])
+            try:
+                gray, cx, cy, r_valid_per_angle, image_half_size = _load_and_detect_boundary(
+                    img_path, self.N_theta,
+                )
+            except FileNotFoundError:
+                warnings.warn(f"[dataset] Image not found, skipping: {img_path}")
+                continue
+            x, mask_t, labels_t, r_max = _build_sample_tensor(
+                gray, cx, cy, r_valid_per_angle,
+                self.N_r, self.N_theta, self.pad_value,
+                use_radial_map=self.use_radial_map,
+            )
+            cat, cont = _build_conditioning(g, r_max, image_half_size, slice_depth_relative)
+            return x, (cat, cont), mask_t, labels_t
+        raise RuntimeError("[dataset] No valid images found in BatteryCTPolarSelectedSamplesDataset.")
 
 
 class BatteryCTPolarUniformCellsMaxPicturesDataset(Dataset):
@@ -513,17 +529,24 @@ class BatteryCTPolarUniformCellsMaxPicturesDataset(Dataset):
             raise KeyError(f"No images indexed for cell_id: {cell_id}. Rebuild cell_index.json")
 
         rng = random.Random(self._stable_seed(cell_id, int(idx)))
-        d = imgs[rng.randrange(len(imgs))]
-        img_path = os.path.join(self.base_path, d["relpath"])
-        slice_depth_relative = float(d.get("rel_depth", 0.0))
-
-        gray, cx, cy, r_valid_per_angle, image_half_size = _load_and_detect_boundary(
-            img_path, self.N_theta,
-        )
-        x, mask_t, labels_t, r_max = _build_sample_tensor(
-            gray, cx, cy, r_valid_per_angle,
-            self.N_r, self.N_theta, self.pad_value,
-            use_radial_map=self.use_radial_map,
-        )
-        cat, cont = _build_conditioning(g, r_max, image_half_size, slice_depth_relative)
-        return x, (cat, cont), mask_t, labels_t
+        order = list(range(len(imgs)))
+        rng.shuffle(order)
+        for i in order:
+            d = imgs[i]
+            img_path = os.path.join(self.base_path, d["relpath"])
+            slice_depth_relative = float(d.get("rel_depth", 0.0))
+            try:
+                gray, cx, cy, r_valid_per_angle, image_half_size = _load_and_detect_boundary(
+                    img_path, self.N_theta,
+                )
+            except FileNotFoundError:
+                warnings.warn(f"[dataset] Image not found, skipping: {img_path}")
+                continue
+            x, mask_t, labels_t, r_max = _build_sample_tensor(
+                gray, cx, cy, r_valid_per_angle,
+                self.N_r, self.N_theta, self.pad_value,
+                use_radial_map=self.use_radial_map,
+            )
+            cat, cont = _build_conditioning(g, r_max, image_half_size, slice_depth_relative)
+            return x, (cat, cont), mask_t, labels_t
+        raise RuntimeError(f"[dataset] All images missing for cell {cell_id!r} in BatteryCTPolarUniformCellsMaxPicturesDataset.")
